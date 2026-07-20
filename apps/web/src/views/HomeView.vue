@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { screenshotLimits } from '@viewport-lab/shared'
 import type { CreateRunRequest, RunStatus } from '@viewport-lab/shared'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage } from 'element-plus'
@@ -93,7 +94,8 @@ function formatTime(value: string | null): string {
             <el-form-item label="Viewport width">
               <el-input-number
                 v-model="form.viewport.width"
-                :min="1"
+                :min="screenshotLimits.viewport.min"
+                :max="screenshotLimits.viewport.max"
                 :step="10"
                 controls-position="right"
               />
@@ -101,7 +103,8 @@ function formatTime(value: string | null): string {
             <el-form-item label="Viewport height">
               <el-input-number
                 v-model="form.viewport.height"
-                :min="1"
+                :min="screenshotLimits.viewport.min"
+                :max="screenshotLimits.viewport.max"
                 :step="10"
                 controls-position="right"
               />
@@ -109,7 +112,8 @@ function formatTime(value: string | null): string {
             <el-form-item label="Device scale factor">
               <el-input-number
                 v-model="form.deviceScaleFactor"
-                :min="0.1"
+                :min="screenshotLimits.deviceScaleFactor.min"
+                :max="screenshotLimits.deviceScaleFactor.max"
                 :step="0.5"
                 controls-position="right"
               />

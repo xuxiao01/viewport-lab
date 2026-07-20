@@ -5,6 +5,7 @@ import { loadEnvFile } from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import fastifyStatic from '@fastify/static'
+import { screenshotLimits } from '@viewport-lab/shared'
 import type {
   ApiErrorResponse,
   CreateRunRequest,
@@ -45,13 +46,16 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
     typeof url !== 'string' ||
     typeof viewport.width !== 'number' ||
     !Number.isInteger(viewport.width) ||
-    viewport.width <= 0 ||
+    viewport.width < screenshotLimits.viewport.min ||
+    viewport.width > screenshotLimits.viewport.max ||
     typeof viewport.height !== 'number' ||
     !Number.isInteger(viewport.height) ||
-    viewport.height <= 0 ||
+    viewport.height < screenshotLimits.viewport.min ||
+    viewport.height > screenshotLimits.viewport.max ||
     typeof deviceScaleFactor !== 'number' ||
     !Number.isFinite(deviceScaleFactor) ||
-    deviceScaleFactor <= 0 ||
+    deviceScaleFactor < screenshotLimits.deviceScaleFactor.min ||
+    deviceScaleFactor > screenshotLimits.deviceScaleFactor.max ||
     typeof fullPage !== 'boolean' ||
     typeof readySelector !== 'string'
   ) {
@@ -149,13 +153,24 @@ async function executeRun(runId: string): Promise<void> {
       error: null,
     })
   } catch (error) {
-    await updateRun(runId, {
-      status: 'failed',
-      completedAt: new Date().toISOString(),
-      error: errorMessage(error),
-    })
+    try {
+      await updateRun(runId, {
+        status: 'failed',
+        completedAt: new Date().toISOString(),
+        error: errorMessage(error),
+      })
+    } catch (persistError) {
+      app.log.error(
+        { err: persistError, runId, originalError: errorMessage(error) },
+        'Failed to persist run failure',
+      )
+    }
   } finally {
-    await browser?.close()
+    try {
+      await browser?.close()
+    } catch (closeError) {
+      app.log.error({ err: closeError, runId }, 'Failed to close Chromium')
+    }
   }
 }
 
@@ -189,7 +204,9 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
     await mkdir(resolve(runsDir, runId), { recursive: true })
     runs.set(runId, run)
     await persistRun(run)
-    void executeRun(runId)
+    void executeRun(runId).catch((error: unknown) => {
+      app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
+    })
     return reply.code(202).send({ run })
   },
 )

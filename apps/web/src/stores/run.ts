@@ -77,5 +77,5 @@ export const useRunStore = defineStore('run', () => {
     }
   }
 
-  return { run, submitting, isTerminal, createRun }
+  return { run, submitting, createRun }
 })
