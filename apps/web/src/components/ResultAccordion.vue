@@ -7,6 +7,7 @@ import type { CaptureTask, PlatformPresetGroup } from '../types/capture'
 const props = defineProps<{
   platforms: PlatformPresetGroup[]
   tasks: CaptureTask[]
+  retryable?: boolean
 }>()
 
 defineEmits<{
@@ -33,8 +34,8 @@ function tasksFor(platformId: string): CaptureTask[] {
   <section class="results-section">
     <div class="results-heading">
       <div>
-        <h2>截图结果</h2>
-        <p>按平台查看本批次产生的真实截图</p>
+        <h2>设备截图</h2>
+        <p>按平台查看该批次保存的真实截图</p>
       </div>
     </div>
 
@@ -54,6 +55,7 @@ function tasksFor(platformId: string): CaptureTask[] {
         </template>
         <ScreenshotGallery
           :tasks="tasksFor(platform.id)"
+          :retryable="retryable"
           @view="$emit('view', $event)"
           @retry="$emit('retry', $event)"
         />

@@ -6,6 +6,7 @@ import type { CaptureTask } from '../types/capture'
 
 const props = defineProps<{
   task: CaptureTask
+  retryable?: boolean
 }>()
 
 defineEmits<{
@@ -87,7 +88,7 @@ function formatTime(value: string | null | undefined): string {
         </div>
       </dl>
       <button
-        v-if="task.status === 'failed'"
+        v-if="task.status === 'failed' && retryable"
         type="button"
         class="retry-button"
         @click="$emit('retry', task.id)"

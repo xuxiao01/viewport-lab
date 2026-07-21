@@ -4,6 +4,7 @@ import type { CaptureTask } from '../types/capture'
 
 defineProps<{
   tasks: CaptureTask[]
+  retryable?: boolean
 }>()
 
 defineEmits<{
@@ -18,6 +19,7 @@ defineEmits<{
       v-for="task in tasks"
       :key="task.id"
       :task="task"
+      :retryable="retryable"
       @view="$emit('view', $event)"
       @retry="$emit('retry', $event)"
     />

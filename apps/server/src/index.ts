@@ -1,20 +1,31 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { loadEnvFile } from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import fastifyStatic from '@fastify/static'
-import { screenshotLimits } from '@viewport-lab/shared'
+import {
+  batchNoteMaxLength,
+  captureDelayValues,
+  screenshotLimits,
+  screenshotPlatformIds,
+} from '@viewport-lab/shared'
 import type {
   ApiErrorResponse,
   BatchManifest,
+  BatchSummary,
+  CaptureDelayMs,
+  CreateBatchRequest,
   CreateBatchResponse,
   CreateRunRequest,
   CreateRunResponse,
   HealthResponse,
+  ListBatchesResponse,
   RunEvent,
   RunManifest,
+  ScreenshotDevicePresetSnapshot,
+  ScreenshotDeviceRun,
 } from '@viewport-lab/shared'
 import Fastify from 'fastify'
 import { chromium } from 'playwright'
@@ -35,10 +46,15 @@ const port = Number.isInteger(portValue) && portValue > 0 ? portValue : 3001
 
 const app = Fastify({ logger: true })
 const runs = new Map<string, RunManifest>()
+const batches = new Map<string, BatchManifest>()
+const batchWriteQueues = new Map<string, Promise<void>>()
+const batchUpdateQueues = new Map<string, Promise<void>>()
 const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
 const batchIdPattern = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}_[0-9a-f]{8}$/i
 const runIdPattern = /^[0-9a-f-]{36}$/i
 const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
+const selectionIdPattern = /^[a-z0-9][a-z0-9:-]{0,127}$/
+const runRegistrationTimeout = 15_000
 const readinessTiming = {
   networkIdleTimeout: 8_000,
   domQuietTime: 700,
@@ -61,11 +77,116 @@ function createBatchId(date: Date): string {
   return `${timestamp}_${randomUUID().slice(0, 8)}`
 }
 
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsedUrl = new URL(value)
+    return parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function isCaptureDelayMs(value: unknown): value is CaptureDelayMs {
+  return typeof value === 'number' && captureDelayValues.includes(value as CaptureDelayMs)
+}
+
+function parseDeviceSnapshot(value: unknown): ScreenshotDevicePresetSnapshot | null {
+  if (!isRecord(value) || !isRecord(value.viewport)) return null
+  const {
+    selectionId,
+    platformId,
+    platformName,
+    presetId,
+    presetName,
+    viewport,
+    deviceScaleFactor,
+    isMobile,
+    hasTouch,
+    fullPage,
+    readySelector,
+    captureDelayMs,
+  } = value
+  if (
+    typeof selectionId !== 'string' ||
+    !selectionIdPattern.test(selectionId) ||
+    typeof platformId !== 'string' ||
+    !screenshotPlatformIds.includes(platformId as (typeof screenshotPlatformIds)[number]) ||
+    typeof platformName !== 'string' ||
+    platformName.trim().length === 0 ||
+    typeof presetId !== 'string' ||
+    !outputNamePattern.test(presetId) ||
+    typeof presetName !== 'string' ||
+    presetName.trim().length === 0 ||
+    typeof viewport.width !== 'number' ||
+    !Number.isInteger(viewport.width) ||
+    viewport.width < screenshotLimits.viewport.min ||
+    viewport.width > screenshotLimits.viewport.max ||
+    typeof viewport.height !== 'number' ||
+    !Number.isInteger(viewport.height) ||
+    viewport.height < screenshotLimits.viewport.min ||
+    viewport.height > screenshotLimits.viewport.max ||
+    typeof deviceScaleFactor !== 'number' ||
+    !Number.isFinite(deviceScaleFactor) ||
+    deviceScaleFactor < screenshotLimits.deviceScaleFactor.min ||
+    deviceScaleFactor > screenshotLimits.deviceScaleFactor.max ||
+    typeof isMobile !== 'boolean' ||
+    typeof hasTouch !== 'boolean' ||
+    typeof fullPage !== 'boolean' ||
+    typeof readySelector !== 'string' ||
+    !isCaptureDelayMs(captureDelayMs)
+  ) {
+    return null
+  }
+
+  return {
+    selectionId,
+    platformId: platformId as ScreenshotDevicePresetSnapshot['platformId'],
+    platformName: platformName.trim(),
+    presetId,
+    presetName: presetName.trim(),
+    viewport: { width: viewport.width, height: viewport.height },
+    deviceScaleFactor,
+    isMobile,
+    hasTouch,
+    fullPage,
+    readySelector: readySelector.trim(),
+    captureDelayMs,
+  }
+}
+
+function parseCreateBatchRequest(value: unknown): CreateBatchRequest | null {
+  if (!isRecord(value)) return null
+  const { url, note, captureDelayMs, devices } = value
+  if (
+    typeof url !== 'string' ||
+    !isHttpUrl(url) ||
+    typeof note !== 'string' ||
+    note.trim().length > batchNoteMaxLength ||
+    !isCaptureDelayMs(captureDelayMs) ||
+    !Array.isArray(devices) ||
+    devices.length === 0 ||
+    devices.length > 100
+  ) {
+    return null
+  }
+  const parsedDevices = devices.map(parseDeviceSnapshot)
+  if (parsedDevices.some((device) => device === null)) return null
+  const validDevices = parsedDevices.filter(
+    (device): device is ScreenshotDevicePresetSnapshot => device !== null,
+  )
+  if (new Set(validDevices.map((device) => device.selectionId)).size !== validDevices.length) {
+    return null
+  }
+  if (validDevices.some((device) => device.captureDelayMs !== captureDelayMs)) return null
+  return { url, note: note.trim(), captureDelayMs, devices: validDevices }
+}
+
 function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
   if (!isRecord(value) || !isRecord(value.viewport)) return null
 
   const {
     batchId,
+    selectionId,
     outputName,
     url,
     viewport,
@@ -74,10 +195,13 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
     hasTouch,
     fullPage,
     readySelector,
+    captureDelayMs,
   } = value
   if (
     typeof batchId !== 'string' ||
     !batchIdPattern.test(batchId) ||
+    typeof selectionId !== 'string' ||
+    !selectionIdPattern.test(selectionId) ||
     typeof outputName !== 'string' ||
     !outputNamePattern.test(outputName) ||
     typeof url !== 'string' ||
@@ -96,20 +220,17 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
     typeof isMobile !== 'boolean' ||
     typeof hasTouch !== 'boolean' ||
     typeof fullPage !== 'boolean' ||
-    typeof readySelector !== 'string'
+    typeof readySelector !== 'string' ||
+    !isCaptureDelayMs(captureDelayMs)
   ) {
     return null
   }
 
-  try {
-    const parsedUrl = new URL(url)
-    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') return null
-  } catch {
-    return null
-  }
+  if (!isHttpUrl(url)) return null
 
   return {
     batchId,
+    selectionId,
     outputName,
     url,
     viewport: { width: viewport.width, height: viewport.height },
@@ -118,19 +239,210 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
     hasTouch,
     fullPage,
     readySelector: readySelector.trim(),
+    captureDelayMs,
   }
 }
 
-function manifestPath(batchId: string, runId: string): string {
-  return resolve(runsDir, batchId, `${runId}.manifest.json`)
+function batchManifestPath(batchId: string): string {
+  return resolve(runsDir, batchId, 'manifest.json')
 }
 
-async function persistRun(run: RunManifest): Promise<void> {
-  await writeFile(
-    manifestPath(run.request.batchId, run.runId),
-    `${JSON.stringify(run, null, 2)}\n`,
-    'utf8',
+function isTerminalRunStatus(status: RunManifest['status']): boolean {
+  return status === 'completed' || status === 'failed'
+}
+
+function isTerminalBatchStatus(status: BatchManifest['status']): boolean {
+  return status === 'completed' || status === 'partial_failed' || status === 'failed'
+}
+
+function aggregateBatch(batch: BatchManifest, now: string): BatchManifest {
+  const successCount = batch.devices.filter((device) => device.status === 'completed').length
+  const failedCount = batch.devices.filter((device) => device.status === 'failed').length
+  const terminalCount = successCount + failedCount
+  let status: BatchManifest['status'] = 'running'
+  if (batch.devices.every((device) => device.status === 'queued')) status = 'queued'
+  if (terminalCount === batch.deviceCount) {
+    if (failedCount === 0) status = 'completed'
+    else if (successCount === 0) status = 'failed'
+    else status = 'partial_failed'
+  }
+  const completedAt = isTerminalBatchStatus(status) ? (batch.completedAt ?? now) : null
+  return {
+    ...batch,
+    status,
+    updatedAt: now,
+    completedAt,
+    durationMs: completedAt
+      ? Math.max(0, new Date(completedAt).getTime() - new Date(batch.createdAt).getTime())
+      : null,
+    successCount,
+    failedCount,
+  }
+}
+
+async function persistBatch(batch: BatchManifest): Promise<void> {
+  const snapshot = `${JSON.stringify(batch, null, 2)}\n`
+  const previous = batchWriteQueues.get(batch.batchId) ?? Promise.resolve()
+  const next = previous
+    .catch(() => undefined)
+    .then(() => writeFile(batchManifestPath(batch.batchId), snapshot, 'utf8'))
+  batchWriteQueues.set(batch.batchId, next)
+  try {
+    await next
+  } finally {
+    if (batchWriteQueues.get(batch.batchId) === next) batchWriteQueues.delete(batch.batchId)
+  }
+}
+
+async function readBatch(batchId: string): Promise<BatchManifest | null> {
+  const memoryBatch = batches.get(batchId)
+  if (memoryBatch) return memoryBatch
+  if (!batchIdPattern.test(batchId)) return null
+  try {
+    const contents = await readFile(batchManifestPath(batchId), 'utf8')
+    const batch = JSON.parse(contents) as BatchManifest
+    if (batch.batchId !== batchId || !Array.isArray(batch.devices)) return null
+    batches.set(batchId, batch)
+    return batch
+  } catch {
+    return null
+  }
+}
+
+function toBatchSummary(batch: BatchManifest): BatchSummary {
+  const {
+    batchId,
+    createdAt,
+    completedAt,
+    url,
+    note,
+    captureDelayMs,
+    status,
+    durationMs,
+    deviceCount,
+    successCount,
+    failedCount,
+  } = batch
+  return {
+    batchId,
+    createdAt,
+    completedAt,
+    url,
+    note,
+    captureDelayMs: captureDelayMs ?? 0,
+    status,
+    durationMs,
+    deviceCount,
+    successCount,
+    failedCount,
+  }
+}
+
+async function listBatches(): Promise<BatchManifest[]> {
+  const entries = await readdir(runsDir, { withFileTypes: true })
+  const loaded = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && batchIdPattern.test(entry.name))
+      .map((entry) => readBatch(entry.name)),
   )
+  return loaded
+    .filter((batch): batch is BatchManifest => batch !== null)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+}
+
+function deviceFromRun(batch: BatchManifest, run: RunManifest): ScreenshotDeviceRun {
+  const snapshot = batch.devices.find((device) => device.selectionId === run.request.selectionId)
+  if (!snapshot) throw new Error(`Device ${run.request.selectionId} does not exist`)
+  return {
+    ...snapshot,
+    runId: run.runId,
+    status: run.status,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    completedAt: run.completedAt,
+    screenshotPath: run.screenshotPath,
+    screenshotUrl: run.screenshotUrl,
+    error: run.error,
+  }
+}
+
+function runFromDevice(batch: BatchManifest, device: ScreenshotDeviceRun): RunManifest | null {
+  if (!device.runId) return null
+  return {
+    runId: device.runId,
+    request: {
+      batchId: batch.batchId,
+      selectionId: device.selectionId,
+      outputName: device.presetId,
+      url: batch.url,
+      viewport: device.viewport,
+      deviceScaleFactor: device.deviceScaleFactor,
+      isMobile: device.isMobile,
+      hasTouch: device.hasTouch,
+      fullPage: device.fullPage,
+      readySelector: device.readySelector,
+      captureDelayMs: device.captureDelayMs ?? batch.captureDelayMs ?? 0,
+    },
+    status: device.status,
+    createdAt: device.createdAt,
+    updatedAt: device.updatedAt,
+    completedAt: device.completedAt,
+    screenshotPath: device.screenshotPath,
+    screenshotUrl: device.screenshotUrl,
+    error: device.error,
+  }
+}
+
+async function enqueueBatchUpdate(batchId: string, operation: () => Promise<void>): Promise<void> {
+  const previous = batchUpdateQueues.get(batchId) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(operation)
+  batchUpdateQueues.set(batchId, next)
+  try {
+    await next
+  } finally {
+    if (batchUpdateQueues.get(batchId) === next) batchUpdateQueues.delete(batchId)
+  }
+}
+
+async function updateBatchForRun(run: RunManifest): Promise<void> {
+  const batchId = run.request.batchId
+  await enqueueBatchUpdate(batchId, async () => {
+    const batch = await readBatch(batchId)
+    if (!batch) throw new Error(`Batch ${batchId} does not exist`)
+    const deviceIndex = batch.devices.findIndex(
+      (device) => device.selectionId === run.request.selectionId,
+    )
+    if (deviceIndex < 0) throw new Error(`Device ${run.request.selectionId} does not exist`)
+    const devices = [...batch.devices]
+    devices[deviceIndex] = deviceFromRun(batch, run)
+    const updated = aggregateBatch({ ...batch, devices, completedAt: null }, run.updatedAt)
+    batches.set(batch.batchId, updated)
+    await persistBatch(updated)
+  })
+}
+
+async function failUnregisteredDevices(batchId: string): Promise<void> {
+  await enqueueBatchUpdate(batchId, async () => {
+    const batch = await readBatch(batchId)
+    if (!batch || isTerminalBatchStatus(batch.status)) return
+    const failedAt = new Date().toISOString()
+    let changed = false
+    const devices = batch.devices.map<ScreenshotDeviceRun>((device) => {
+      if (device.runId) return device
+      changed = true
+      return {
+        ...device,
+        status: 'failed',
+        updatedAt: failedAt,
+        completedAt: failedAt,
+        error: '截图任务未能在限定时间内启动',
+      }
+    })
+    if (!changed) return
+    const updated = aggregateBatch({ ...batch, devices, completedAt: null }, failedAt)
+    batches.set(batchId, updated)
+    await persistBatch(updated)
+  })
 }
 
 function publish(run: RunManifest): void {
@@ -143,7 +455,7 @@ async function updateRun(runId: string, patch: Partial<RunManifest>): Promise<Ru
   if (!current) throw new Error(`Run ${runId} does not exist`)
   const updated: RunManifest = { ...current, ...patch, updatedAt: new Date().toISOString() }
   runs.set(runId, updated)
-  await persistRun(updated)
+  await updateBatchForRun(updated)
   publish(updated)
   return updated
 }
@@ -153,17 +465,50 @@ async function getRun(runId: string): Promise<RunManifest | null> {
   if (memoryRun) return memoryRun
   if (!runIdPattern.test(runId)) return null
 
-  const batchDirectories = await readdir(runsDir, { withFileTypes: true })
-  for (const entry of batchDirectories) {
-    if (!entry.isDirectory() || !batchIdPattern.test(entry.name)) continue
-    try {
-      const contents = await readFile(manifestPath(entry.name, runId), 'utf8')
-      return JSON.parse(contents) as RunManifest
-    } catch {
-      // Continue searching other batch directories.
-    }
+  for (const batch of await listBatches()) {
+    const device = batch.devices.find((item) => item.runId === runId)
+    if (device) return runFromDevice(batch, device)
   }
   return null
+}
+
+function requestMatchesDevice(
+  request: CreateRunRequest,
+  batch: BatchManifest,
+  device: ScreenshotDeviceRun,
+): boolean {
+  return (
+    request.url === batch.url &&
+    request.outputName === device.presetId &&
+    request.viewport.width === device.viewport.width &&
+    request.viewport.height === device.viewport.height &&
+    request.deviceScaleFactor === device.deviceScaleFactor &&
+    request.isMobile === device.isMobile &&
+    request.hasTouch === device.hasTouch &&
+    request.fullPage === device.fullPage &&
+    request.readySelector === device.readySelector &&
+    request.captureDelayMs === (device.captureDelayMs ?? batch.captureDelayMs ?? 0)
+  )
+}
+
+async function normalizeInterruptedBatches(): Promise<void> {
+  const interruptedAt = new Date().toISOString()
+  for (const batch of await listBatches()) {
+    if (isTerminalBatchStatus(batch.status)) continue
+    const devices = batch.devices.map<ScreenshotDeviceRun>((device) => {
+      if (isTerminalRunStatus(device.status)) return device
+      return {
+        ...device,
+        status: 'failed',
+        updatedAt: interruptedAt,
+        completedAt: interruptedAt,
+        error: '截图服务已重启，任务未能完成',
+      }
+    })
+    const updated = aggregateBatch({ ...batch, devices, completedAt: null }, interruptedAt)
+    batches.set(batch.batchId, updated)
+    await persistBatch(updated)
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -326,6 +671,14 @@ async function executeRun(runId: string): Promise<void> {
 
     await updateRun(runId, { status: 'waiting' })
     await waitForPageReady(page, launching.request.readySelector, runId)
+    if (launching.request.captureDelayMs > 0) {
+      app.log.debug(
+        { runId, delayMs: launching.request.captureDelayMs },
+        'Applying additional capture delay',
+      )
+      await page.waitForTimeout(launching.request.captureDelayMs)
+      await waitForPageReady(page, launching.request.readySelector, runId)
+    }
 
     await updateRun(runId, { status: 'capturing' })
     const screenshotFileName = `${launching.request.outputName}.png`
@@ -362,6 +715,7 @@ async function executeRun(runId: string): Promise<void> {
 }
 
 await mkdir(runsDir, { recursive: true })
+await normalizeInterruptedBatches()
 await app.register(fastifyStatic, { root: runsDir, prefix: '/outputs/' })
 
 app.get<{ Reply: HealthResponse }>('/api/health', async () => ({
@@ -369,20 +723,86 @@ app.get<{ Reply: HealthResponse }>('/api/health', async () => ({
   timestamp: new Date().toISOString(),
 }))
 
-app.post<{ Reply: CreateBatchResponse }>('/api/batches', async (_request, reply) => {
-  const createdAt = new Date()
-  const batch: BatchManifest = {
-    batchId: createBatchId(createdAt),
-    createdAt: createdAt.toISOString(),
+app.post<{ Body: unknown; Reply: CreateBatchResponse | ApiErrorResponse }>(
+  '/api/batches',
+  async (request, reply) => {
+    const parsed = parseCreateBatchRequest(request.body)
+    if (!parsed) return reply.code(400).send({ error: 'Invalid screenshot batch request' })
+
+    const createdAt = new Date()
+    const now = createdAt.toISOString()
+    const batchId = createBatchId(createdAt)
+    const devices = parsed.devices.map<ScreenshotDeviceRun>((device) => ({
+      ...device,
+      runId: null,
+      status: 'queued',
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      screenshotPath: null,
+      screenshotUrl: null,
+      error: null,
+    }))
+    const batch: BatchManifest = {
+      batchId,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      url: parsed.url,
+      note: parsed.note,
+      captureDelayMs: parsed.captureDelayMs,
+      status: 'queued',
+      durationMs: null,
+      deviceCount: devices.length,
+      successCount: 0,
+      failedCount: 0,
+      devices,
+    }
+    const batchDirectory = resolve(runsDir, batchId)
+    await mkdir(batchDirectory, { recursive: true })
+    batches.set(batchId, batch)
+    await persistBatch(batch)
+    const registrationTimer = setTimeout(() => {
+      void failUnregisteredDevices(batchId).catch((error: unknown) => {
+        app.log.error({ err: error, batchId }, 'Failed to finalize unregistered screenshot devices')
+      })
+    }, runRegistrationTimeout)
+    registrationTimer.unref()
+    return reply.code(201).send({ batch })
+  },
+)
+
+app.get<{ Reply: ListBatchesResponse }>('/api/batches', async () => ({
+  batches: (await listBatches()).map(toBatchSummary),
+}))
+
+app.get<{
+  Params: { batchId: string }
+  Reply: BatchManifest | ApiErrorResponse
+}>('/api/batches/:batchId', async (request, reply) => {
+  const batch = await readBatch(request.params.batchId)
+  if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
+  return reply.send(batch)
+})
+
+app.delete<{ Params: { batchId: string } }>('/api/batches/:batchId', async (request, reply) => {
+  const { batchId } = request.params
+  const batch = await readBatch(batchId)
+  if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
+  if (!isTerminalBatchStatus(batch.status)) {
+    return reply.code(409).send({ error: 'Running screenshot batches cannot be deleted' })
   }
-  const batchDirectory = resolve(runsDir, batch.batchId)
-  await mkdir(batchDirectory, { recursive: true })
-  await writeFile(
-    resolve(batchDirectory, 'batch.json'),
-    `${JSON.stringify(batch, null, 2)}\n`,
-    'utf8',
-  )
-  return reply.code(201).send({ batch })
+  await batchUpdateQueues.get(batchId)
+  await batchWriteQueues.get(batchId)
+  for (const device of batch.devices) {
+    if (device.runId) {
+      runs.delete(device.runId)
+      subscribers.delete(device.runId)
+    }
+  }
+  batches.delete(batchId)
+  await rm(resolve(runsDir, batchId), { recursive: true })
+  return reply.code(204).send()
 })
 
 app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
@@ -390,11 +810,14 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
   async (request, reply) => {
     const parsed = parseCreateRunRequest(request.body)
     if (!parsed) return reply.code(400).send({ error: 'Invalid screenshot request' })
-
-    try {
-      await readFile(resolve(runsDir, parsed.batchId, 'batch.json'), 'utf8')
-    } catch {
-      return reply.code(400).send({ error: 'Screenshot batch does not exist' })
+    const batch = await readBatch(parsed.batchId)
+    if (!batch) return reply.code(400).send({ error: 'Screenshot batch does not exist' })
+    const device = batch.devices.find((item) => item.selectionId === parsed.selectionId)
+    if (!device || !requestMatchesDevice(parsed, batch, device)) {
+      return reply.code(400).send({ error: 'Screenshot request does not match the batch manifest' })
+    }
+    if (device.runId && device.status !== 'failed') {
+      return reply.code(409).send({ error: 'Screenshot device is already running or completed' })
     }
 
     const createdAt = new Date()
@@ -412,7 +835,7 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
       error: null,
     }
     runs.set(runId, run)
-    await persistRun(run)
+    await updateBatchForRun(run)
     void executeRun(runId).catch((error: unknown) => {
       app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
     })
