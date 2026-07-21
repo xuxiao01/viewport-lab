@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "pnpm --filter @viewport-lab/shared build && concurrently -n web,server -c cyan,green \"pnpm --filter @viewport-lab/web dev\" \"pnpm --filter @viewport-lab/server dev\"",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter @viewport-lab/shared build && pnpm -r typecheck",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

@@ -1,6 +1,6 @@
-import type { RunManifest, RunStatus, Viewport } from '@viewport-lab/shared'
+import type { RunManifest, RunStatus, ScreenshotPlatformId, Viewport } from '@viewport-lab/shared'
 
-export type PlatformId = 'ios-phone' | 'ios-tablet' | 'android-phone' | 'android-tablet'
+export type PlatformId = ScreenshotPlatformId
 
 export interface ViewportPreset {
   id: string
@@ -15,13 +15,12 @@ export interface ViewportPreset {
   readySelector: ''
 }
 
-export type SelectionState = 'checked' | 'indeterminate' | 'unchecked'
-
 export interface PlatformPresetGroup {
   id: PlatformId
   name: string
   shortName: string
   description: string
+  notice?: string
   presets: ViewportPreset[]
 }
 

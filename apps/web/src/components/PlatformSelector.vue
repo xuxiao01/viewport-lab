@@ -1,63 +1,36 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-
-import ApplePresetSelector from './ApplePresetSelector.vue'
 import PlatformCard from './PlatformCard.vue'
 import { getPlatformPresetIds } from '../config/viewport-presets'
-import type { PlatformPresetGroup, SelectionState } from '../types/capture'
+import type { PlatformId, PlatformPresetGroup } from '../types/capture'
 
 const props = defineProps<{
   platforms: PlatformPresetGroup[]
+  selectedCategories: PlatformId[]
   selectedPresetIds: string[]
   disabled: boolean
 }>()
 
 const emit = defineEmits<{
-  'update:selectedPresetIds': [value: string[]]
+  toggleCategory: [platformId: PlatformId]
 }>()
 
-const applePhonePlatform = computed(() =>
-  props.platforms.find((platform) => platform.id === 'ios-phone'),
-)
-
-function getSelectionState(platform: PlatformPresetGroup): SelectionState {
+function getSelectedCount(platform: PlatformPresetGroup): number {
   const presetIds = getPlatformPresetIds(platform)
-  const selectedCount = presetIds.filter((id) => props.selectedPresetIds.includes(id)).length
-  if (selectedCount === 0) return 'unchecked'
-  if (selectedCount === presetIds.length) return 'checked'
-  return 'indeterminate'
-}
-
-function togglePlatform(platform: PlatformPresetGroup): void {
-  const presetIds = getPlatformPresetIds(platform)
-  const shouldClear = getSelectionState(platform) === 'checked'
-  const otherIds = props.selectedPresetIds.filter((id) => !presetIds.includes(id))
-  emit('update:selectedPresetIds', shouldClear ? otherIds : [...otherIds, ...presetIds])
-}
-
-function updateSelectedPresetIds(value: string[]): void {
-  emit('update:selectedPresetIds', value)
+  return presetIds.filter((id) => props.selectedPresetIds.includes(id)).length
 }
 </script>
 
 <template>
-  <div>
-    <div class="selector-grid">
-      <PlatformCard
-        v-for="platform in platforms"
-        :key="platform.id"
-        :platform="platform"
-        :selection-state="getSelectionState(platform)"
-        :disabled="disabled"
-        @toggle="togglePlatform(platform)"
-      />
-    </div>
-    <ApplePresetSelector
-      v-if="applePhonePlatform && getSelectionState(applePhonePlatform) !== 'unchecked'"
-      :platform="applePhonePlatform"
-      :selected-preset-ids="selectedPresetIds"
+  <div class="selector-grid">
+    <PlatformCard
+      v-for="platform in platforms"
+      :key="platform.id"
+      :platform="platform"
+      :selected="selectedCategories.includes(platform.id)"
+      :selected-count="getSelectedCount(platform)"
+      :total-count="platform.presets.length"
       :disabled="disabled"
-      @update:selected-preset-ids="updateSelectedPresetIds"
+      @toggle="emit('toggleCategory', platform.id)"
     />
   </div>
 </template>

@@ -1,38 +1,43 @@
 <script setup lang="ts">
-import type { PlatformPresetGroup, SelectionState } from '../types/capture'
+import { computed } from 'vue'
 
-defineProps<{
+import type { PlatformPresetGroup } from '../types/capture'
+
+const props = defineProps<{
   platform: PlatformPresetGroup
-  selectionState: SelectionState
+  selected: boolean
+  selectedCount: number
+  totalCount: number
   disabled: boolean
 }>()
 
 defineEmits<{
   toggle: []
 }>()
+
+const selectionLabel = computed(() =>
+  props.selected ? `已选 ${props.selectedCount}/${props.totalCount}` : `${props.totalCount} 个预设`,
+)
 </script>
 
 <template>
   <button
     type="button"
     class="platform-card"
-    :class="{ active: selectionState !== 'unchecked' }"
+    :class="{ active: selected }"
     role="checkbox"
-    :aria-checked="selectionState === 'indeterminate' ? 'mixed' : selectionState === 'checked'"
+    :aria-checked="selected"
     :disabled="disabled"
     @click="$emit('toggle')"
   >
     <span class="platform-icon">{{ platform.shortName }}</span>
     <span class="platform-copy">
       <strong>{{ platform.name }}</strong>
-      <small>{{ platform.presets.length }} 个预设</small>
+      <small>{{ selectionLabel }}</small>
     </span>
     <span class="selection-mark" aria-hidden="true">
-      <svg v-if="selectionState === 'checked'" viewBox="0 0 16 16" fill="none">
+      <svg v-if="selected" viewBox="0 0 16 16" fill="none">
         <path d="m3.5 8.2 2.8 2.8 6.2-6.2" stroke="currentColor" stroke-width="1.8" />
-      </svg>
-      <svg v-else-if="selectionState === 'indeterminate'" viewBox="0 0 16 16" fill="none">
-        <path d="M3.5 8h9" stroke="currentColor" stroke-width="1.8" />
       </svg>
     </span>
   </button>
