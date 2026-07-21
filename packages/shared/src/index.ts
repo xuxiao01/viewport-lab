@@ -10,17 +10,35 @@ export const runStatuses = [
 
 export type RunStatus = (typeof runStatuses)[number]
 
+export const screenshotLimits = {
+  viewport: { min: 1, max: 10_000 },
+  deviceScaleFactor: { min: 0.1, max: 4 },
+} as const
+
 export interface Viewport {
   width: number
   height: number
 }
 
 export interface CreateRunRequest {
+  batchId: string
+  outputName: string
   url: string
   viewport: Viewport
   deviceScaleFactor: number
+  isMobile: boolean
+  hasTouch: boolean
   fullPage: boolean
   readySelector: string
+}
+
+export interface BatchManifest {
+  batchId: string
+  createdAt: string
+}
+
+export interface CreateBatchResponse {
+  batch: BatchManifest
 }
 
 export interface RunManifest {

@@ -43,12 +43,15 @@ cp .env.example .env
 pnpm dev
 ```
 
-打开 `http://localhost:5188`，保留默认参数（URL 为前端自身、viewport 为 360 × 800、DPR 为 1），点击“开始截图”。状态会依次更新，成功后截图会出现在右侧预览区。
+打开 `http://localhost:5188`，输入目标页面完整 URL，选择需要检查的平台和视口预设，然后点击“开始批量截图”。页面默认选中苹果手机的 5 个逻辑视口，并在截图完成后按平台展示真实结果。
+手机和平板预设会同时启用 Chromium 的移动布局与触摸模拟，使页面 viewport 行为与 Chrome DevTools 响应式模式保持一致。
 
-截图和运行记录位于 `data/runs/{runId}`：
+每次点击“开始批量截图”都会在 `data/runs/{batchId}` 创建一个独立批次目录。目录名以本地批次创建时间开头，例如
+`2026-07-20_23-18-42-057_a1b2c3d4`：
 
-- `manifest.json`：请求参数、状态、时间和错误信息
-- `screenshot.png`：截图文件
+- `batch.json`：批次标识和创建时间
+- `{presetId}.png`：该批次中每个视口预设的截图，例如 `iphone-390x844.png`
+- `{runId}.manifest.json`：每个截图任务的请求参数、状态、时间和错误信息
 
 运行记录不会提交到 Git。
 
@@ -65,10 +68,11 @@ pnpm build
 ## API
 
 - `GET /api/health`
+- `POST /api/batches`
 - `POST /api/runs`
 - `GET /api/runs/:runId`
 - `GET /api/runs/:runId/events`（SSE）
-- `GET /outputs/:runId/screenshot.png`
+- `GET /outputs/:batchId/:presetId.png`
 
 任务状态和 SSE 订阅保存在服务进程内，manifest 持久化到磁盘。服务重启后不会恢复未完成任务。前端优先使用 SSE 接收进度，连接失败时自动降级为每秒轮询运行查询接口。
 

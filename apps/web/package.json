@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5188",
-    "build": "vue-tsc -b && vite build",
-    "typecheck": "vue-tsc -b --noEmit",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "lint": "eslint src"
   },
   "dependencies": {

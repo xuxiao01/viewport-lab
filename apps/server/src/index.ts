@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { loadEnvFile } from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import fastifyStatic from '@fastify/static'
+import { screenshotLimits } from '@viewport-lab/shared'
 import type {
   ApiErrorResponse,
+  BatchManifest,
+  CreateBatchResponse,
   CreateRunRequest,
   CreateRunResponse,
   HealthResponse,
@@ -15,6 +18,7 @@ import type {
 } from '@viewport-lab/shared'
 import Fastify from 'fastify'
 import { chromium } from 'playwright'
+import type { Page } from 'playwright'
 
 const rootDir = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 const runsDir = resolve(rootDir, 'data/runs')
@@ -32,26 +36,58 @@ const port = Number.isInteger(portValue) && portValue > 0 ? portValue : 3001
 const app = Fastify({ logger: true })
 const runs = new Map<string, RunManifest>()
 const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
+const batchIdPattern = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}_[0-9a-f]{8}$/i
+const runIdPattern = /^[0-9a-f-]{36}$/i
+const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
+function createBatchId(date: Date): string {
+  const pad = (value: number, length = 2): string => String(value).padStart(length, '0')
+  const timestamp = [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}-${pad(date.getMilliseconds(), 3)}`,
+  ].join('_')
+
+  return `${timestamp}_${randomUUID().slice(0, 8)}`
+}
+
 function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
   if (!isRecord(value) || !isRecord(value.viewport)) return null
 
-  const { url, viewport, deviceScaleFactor, fullPage, readySelector } = value
+  const {
+    batchId,
+    outputName,
+    url,
+    viewport,
+    deviceScaleFactor,
+    isMobile,
+    hasTouch,
+    fullPage,
+    readySelector,
+  } = value
   if (
+    typeof batchId !== 'string' ||
+    !batchIdPattern.test(batchId) ||
+    typeof outputName !== 'string' ||
+    !outputNamePattern.test(outputName) ||
     typeof url !== 'string' ||
     typeof viewport.width !== 'number' ||
     !Number.isInteger(viewport.width) ||
-    viewport.width <= 0 ||
+    viewport.width < screenshotLimits.viewport.min ||
+    viewport.width > screenshotLimits.viewport.max ||
     typeof viewport.height !== 'number' ||
     !Number.isInteger(viewport.height) ||
-    viewport.height <= 0 ||
+    viewport.height < screenshotLimits.viewport.min ||
+    viewport.height > screenshotLimits.viewport.max ||
     typeof deviceScaleFactor !== 'number' ||
     !Number.isFinite(deviceScaleFactor) ||
-    deviceScaleFactor <= 0 ||
+    deviceScaleFactor < screenshotLimits.deviceScaleFactor.min ||
+    deviceScaleFactor > screenshotLimits.deviceScaleFactor.max ||
+    typeof isMobile !== 'boolean' ||
+    typeof hasTouch !== 'boolean' ||
     typeof fullPage !== 'boolean' ||
     typeof readySelector !== 'string'
   ) {
@@ -66,20 +102,28 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
   }
 
   return {
+    batchId,
+    outputName,
     url,
     viewport: { width: viewport.width, height: viewport.height },
     deviceScaleFactor,
+    isMobile,
+    hasTouch,
     fullPage,
     readySelector: readySelector.trim(),
   }
 }
 
-function manifestPath(runId: string): string {
-  return resolve(runsDir, runId, 'manifest.json')
+function manifestPath(batchId: string, runId: string): string {
+  return resolve(runsDir, batchId, `${runId}.manifest.json`)
 }
 
 async function persistRun(run: RunManifest): Promise<void> {
-  await writeFile(manifestPath(run.runId), `${JSON.stringify(run, null, 2)}\n`, 'utf8')
+  await writeFile(
+    manifestPath(run.request.batchId, run.runId),
+    `${JSON.stringify(run, null, 2)}\n`,
+    'utf8',
+  )
 }
 
 function publish(run: RunManifest): void {
@@ -100,18 +144,53 @@ async function updateRun(runId: string, patch: Partial<RunManifest>): Promise<Ru
 async function getRun(runId: string): Promise<RunManifest | null> {
   const memoryRun = runs.get(runId)
   if (memoryRun) return memoryRun
-  if (!/^[0-9a-f-]{36}$/i.test(runId)) return null
+  if (!runIdPattern.test(runId)) return null
 
-  try {
-    const contents = await readFile(manifestPath(runId), 'utf8')
-    return JSON.parse(contents) as RunManifest
-  } catch {
-    return null
+  const batchDirectories = await readdir(runsDir, { withFileTypes: true })
+  for (const entry of batchDirectories) {
+    if (!entry.isDirectory() || !batchIdPattern.test(entry.name)) continue
+    try {
+      const contents = await readFile(manifestPath(entry.name, runId), 'utf8')
+      return JSON.parse(contents) as RunManifest
+    } catch {
+      // Continue searching other batch directories.
+    }
   }
+  return null
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown screenshot error'
+}
+
+function isCaptureScreenshotError(error: unknown): boolean {
+  return errorMessage(error).includes('Page.captureScreenshot')
+}
+
+async function waitForPaint(page: Page): Promise<void> {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolvePaint) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolvePaint()))
+      }),
+  )
+}
+
+async function captureScreenshot(
+  page: Page,
+  screenshotPath: string,
+  fullPage: boolean,
+  runId: string,
+): Promise<void> {
+  await waitForPaint(page)
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage })
+  } catch (error) {
+    if (!isCaptureScreenshotError(error)) throw error
+    app.log.warn({ err: error, runId }, 'Screenshot capture failed; retrying once')
+    await waitForPaint(page)
+    await page.screenshot({ path: screenshotPath, fullPage })
+  }
 }
 
 async function executeRun(runId: string): Promise<void> {
@@ -121,7 +200,10 @@ async function executeRun(runId: string): Promise<void> {
     browser = await chromium.launch()
     const context = await browser.newContext({
       viewport: launching.request.viewport,
+      screen: launching.request.viewport,
       deviceScaleFactor: launching.request.deviceScaleFactor,
+      isMobile: launching.request.isMobile,
+      hasTouch: launching.request.hasTouch,
     })
     const page = await context.newPage()
     page.setDefaultNavigationTimeout(30_000)
@@ -138,24 +220,36 @@ async function executeRun(runId: string): Promise<void> {
     await page.waitForFunction(() => Array.from(document.images).every((image) => image.complete))
 
     await updateRun(runId, { status: 'capturing' })
-    const screenshotPath = resolve(runsDir, runId, 'screenshot.png')
-    await page.screenshot({ path: screenshotPath, fullPage: launching.request.fullPage })
+    const screenshotFileName = `${launching.request.outputName}.png`
+    const screenshotPath = resolve(runsDir, launching.request.batchId, screenshotFileName)
+    await captureScreenshot(page, screenshotPath, launching.request.fullPage, runId)
     const completedAt = new Date().toISOString()
     await updateRun(runId, {
       status: 'completed',
       completedAt,
-      screenshotPath: `data/runs/${runId}/screenshot.png`,
-      screenshotUrl: `/outputs/${runId}/screenshot.png`,
+      screenshotPath: `data/runs/${launching.request.batchId}/${screenshotFileName}`,
+      screenshotUrl: `/outputs/${launching.request.batchId}/${screenshotFileName}`,
       error: null,
     })
   } catch (error) {
-    await updateRun(runId, {
-      status: 'failed',
-      completedAt: new Date().toISOString(),
-      error: errorMessage(error),
-    })
+    try {
+      await updateRun(runId, {
+        status: 'failed',
+        completedAt: new Date().toISOString(),
+        error: errorMessage(error),
+      })
+    } catch (persistError) {
+      app.log.error(
+        { err: persistError, runId, originalError: errorMessage(error) },
+        'Failed to persist run failure',
+      )
+    }
   } finally {
-    await browser?.close()
+    try {
+      await browser?.close()
+    } catch (closeError) {
+      app.log.error({ err: closeError, runId }, 'Failed to close Chromium')
+    }
   }
 }
 
@@ -167,14 +261,37 @@ app.get<{ Reply: HealthResponse }>('/api/health', async () => ({
   timestamp: new Date().toISOString(),
 }))
 
+app.post<{ Reply: CreateBatchResponse }>('/api/batches', async (_request, reply) => {
+  const createdAt = new Date()
+  const batch: BatchManifest = {
+    batchId: createBatchId(createdAt),
+    createdAt: createdAt.toISOString(),
+  }
+  const batchDirectory = resolve(runsDir, batch.batchId)
+  await mkdir(batchDirectory, { recursive: true })
+  await writeFile(
+    resolve(batchDirectory, 'batch.json'),
+    `${JSON.stringify(batch, null, 2)}\n`,
+    'utf8',
+  )
+  return reply.code(201).send({ batch })
+})
+
 app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
   '/api/runs',
   async (request, reply) => {
     const parsed = parseCreateRunRequest(request.body)
     if (!parsed) return reply.code(400).send({ error: 'Invalid screenshot request' })
 
+    try {
+      await readFile(resolve(runsDir, parsed.batchId, 'batch.json'), 'utf8')
+    } catch {
+      return reply.code(400).send({ error: 'Screenshot batch does not exist' })
+    }
+
+    const createdAt = new Date()
     const runId = randomUUID()
-    const now = new Date().toISOString()
+    const now = createdAt.toISOString()
     const run: RunManifest = {
       runId,
       request: parsed,
@@ -186,10 +303,11 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
       screenshotUrl: null,
       error: null,
     }
-    await mkdir(resolve(runsDir, runId), { recursive: true })
     runs.set(runId, run)
     await persistRun(run)
-    void executeRun(runId)
+    void executeRun(runId).catch((error: unknown) => {
+      app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
+    })
     return reply.code(202).send({ run })
   },
 )
