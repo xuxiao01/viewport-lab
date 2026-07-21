@@ -1,0 +1,46 @@
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+
+jobs:
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' && (github.event_name == 'pull_request' || github.event.issue.pull_request) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR Agent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          config.model: "gemini/gemini-3.5-flash"
+          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "false"
+          pr_reviewer.extra_instructions: >
+            请重点从前端工程质量角度审查本次 PR：
+            1. TypeScript 类型是否合理，是否存在 any 滥用或类型缺失；
+            2. 组件拆分是否清晰，是否存在单文件过长、职责混乱；
+            3. API 请求是否处理 loading、error、empty 状态；
+            4. 表单是否有基本校验，是否存在重复提交风险；
+            5. 是否存在 token、密钥、接口地址等敏感信息硬编码；
+            6. 是否存在 console.log、debugger、临时代码；
+            7. CSS 是否可维护，是否存在重复样式或难以调试的样式；
+            8. 是否可能影响已有页面逻辑；
+            9. 是否缺少必要的测试说明或手动验证说明。
+            请不要只给泛泛建议，要尽量指出具体文件、具体代码位置和具体原因。
+          pr_description.extra_instructions: >
+            请生成清晰的中文 PR 描述，包含：
+            1. 本次改动概述；
+            2. 主要修改点；
+            3. 影响范围；
+            4. 需要重点 Review 的地方；
+            5. 建议的测试方式。

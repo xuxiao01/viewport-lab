@@ -15,13 +15,12 @@ export interface ViewportPreset {
   readySelector: ''
 }
 
-export type SelectionState = 'checked' | 'indeterminate' | 'unchecked'
-
 export interface PlatformPresetGroup {
   id: PlatformId
   name: string
   shortName: string
   description: string
+  notice?: string
   presets: ViewportPreset[]
 }
 

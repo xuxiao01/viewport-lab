@@ -41,7 +41,7 @@ const hiddenModelCount = computed(() => Math.max(0, props.preset.representativeM
       </span>
     </div>
 
-    <div class="models-block">
+    <div v-if="preset.representativeModels.length > 0" class="models-block">
       <span class="models-label">代表机型</span>
       <div class="model-tags">
         <span v-for="model in visibleModels" :key="model" class="model-tag">{{ model }}</span>

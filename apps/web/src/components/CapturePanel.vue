@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
+import DevicePresetPanel from './DevicePresetPanel.vue'
 import PlatformSelector from './PlatformSelector.vue'
-import type { PlatformPresetGroup } from '../types/capture'
+import { getPlatformPresetIds } from '../config/viewport-presets'
+import type { PlatformId, PlatformPresetGroup } from '../types/capture'
 
 const props = defineProps<{
   url: string
+  selectedCategories: PlatformId[]
+  activeCategory: PlatformId | null
   selectedPresetIds: string[]
   platforms: PlatformPresetGroup[]
   running: boolean
@@ -13,11 +17,21 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   'update:url': [value: string]
+  'update:activeCategory': [value: PlatformId]
   'update:selectedPresetIds': [value: string[]]
+  toggleCategory: [platformId: PlatformId]
   start: []
 }>()
 
-const selectedPresetCount = computed(() => props.selectedPresetIds.length)
+const selectedPresetCount = computed(() =>
+  props.platforms.reduce((count, platform) => {
+    if (!props.selectedCategories.includes(platform.id)) return count
+    return (
+      count +
+      getPlatformPresetIds(platform).filter((id) => props.selectedPresetIds.includes(id)).length
+    )
+  }, 0),
+)
 
 const isValidUrl = computed(() => {
   try {
@@ -68,12 +82,22 @@ const canStart = computed(() => isValidUrl.value && selectedPresetCount.value > 
 
     <div class="platform-heading">
       <strong>选择平台</strong>
-      <span>支持多选，执行所选平台下的全部预设</span>
+      <span>支持多选，执行所选平台下已勾选的预设</span>
     </div>
     <PlatformSelector
       :platforms="platforms"
+      :selected-categories="selectedCategories"
       :selected-preset-ids="selectedPresetIds"
       :disabled="running"
+      @toggle-category="emit('toggleCategory', $event)"
+    />
+    <DevicePresetPanel
+      :platforms="platforms"
+      :selected-categories="selectedCategories"
+      :active-category="activeCategory"
+      :selected-preset-ids="selectedPresetIds"
+      :disabled="running"
+      @update:active-category="emit('update:activeCategory', $event)"
       @update:selected-preset-ids="emit('update:selectedPresetIds', $event)"
     />
   </section>

@@ -39,6 +39,13 @@ const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
 const batchIdPattern = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}_[0-9a-f]{8}$/i
 const runIdPattern = /^[0-9a-f-]{36}$/i
 const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
+const readinessTiming = {
+  networkIdleTimeout: 8_000,
+  domQuietTime: 700,
+  domStabilityTimeout: 5_000,
+  domPollInterval: 150,
+  finalSettleTime: 750,
+} as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -167,6 +174,110 @@ function isCaptureScreenshotError(error: unknown): boolean {
   return errorMessage(error).includes('Page.captureScreenshot')
 }
 
+function safeResourceUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    return `${url.origin}${url.pathname}`
+  } catch {
+    return value
+  }
+}
+
+function observePageFailures(page: Page, runId: string): void {
+  page.on('pageerror', (error) => {
+    app.log.warn({ err: error, runId }, 'Target page script error')
+  })
+  page.on('requestfailed', (request) => {
+    app.log.warn(
+      {
+        runId,
+        method: request.method(),
+        resourceType: request.resourceType(),
+        url: safeResourceUrl(request.url()),
+        failure: request.failure()?.errorText ?? 'Unknown request failure',
+      },
+      'Target page request failed',
+    )
+  })
+  page.on('response', (response) => {
+    if (response.status() < 400) return
+    app.log.warn(
+      {
+        runId,
+        status: response.status(),
+        url: safeResourceUrl(response.url()),
+      },
+      'Target page returned an error response',
+    )
+  })
+}
+
+async function waitForNetworkIdle(page: Page, runId: string): Promise<void> {
+  try {
+    await page.waitForLoadState('networkidle', { timeout: readinessTiming.networkIdleTimeout })
+  } catch (error) {
+    if (page.isClosed()) throw error
+    app.log.debug(
+      { runId, timeout: readinessTiming.networkIdleTimeout },
+      'Network did not become idle before the soft timeout',
+    )
+  }
+}
+
+async function waitForVisibleImages(page: Page): Promise<void> {
+  await page.waitForFunction(() =>
+    Array.from(document.images)
+      .filter((image) => {
+        const rect = image.getBoundingClientRect()
+        return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth
+      })
+      .every((image) => image.complete),
+  )
+
+  await page.evaluate(async () => {
+    const visibleLoadedImages = Array.from(document.images).filter((image) => {
+      const rect = image.getBoundingClientRect()
+      const isVisible =
+        rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth
+      return isVisible && image.complete && image.naturalWidth > 0
+    })
+    await Promise.allSettled(visibleLoadedImages.map((image) => image.decode()))
+  })
+}
+
+async function waitForDomStability(page: Page, runId: string): Promise<void> {
+  const startedAt = Date.now()
+  let stableSince = startedAt
+  let previousContent = await page.content()
+
+  while (Date.now() - startedAt < readinessTiming.domStabilityTimeout) {
+    await page.waitForTimeout(readinessTiming.domPollInterval)
+    const currentContent = await page.content()
+    if (currentContent !== previousContent) {
+      previousContent = currentContent
+      stableSince = Date.now()
+      continue
+    }
+    if (Date.now() - stableSince >= readinessTiming.domQuietTime) return
+  }
+
+  app.log.debug(
+    { runId, timeout: readinessTiming.domStabilityTimeout },
+    'DOM did not become stable before the soft timeout',
+  )
+}
+
+async function waitForPageReady(page: Page, readySelector: string, runId: string): Promise<void> {
+  if (readySelector) {
+    await page.locator(readySelector).waitFor({ state: 'visible' })
+  }
+  await waitForNetworkIdle(page, runId)
+  await page.waitForFunction(() => document.fonts.status === 'loaded')
+  await waitForVisibleImages(page)
+  await waitForDomStability(page, runId)
+  await page.waitForTimeout(readinessTiming.finalSettleTime)
+}
+
 async function waitForPaint(page: Page): Promise<void> {
   await page.evaluate(
     () =>
@@ -208,16 +319,13 @@ async function executeRun(runId: string): Promise<void> {
     const page = await context.newPage()
     page.setDefaultNavigationTimeout(30_000)
     page.setDefaultTimeout(15_000)
+    observePageFailures(page, runId)
 
     await updateRun(runId, { status: 'navigating' })
     await page.goto(launching.request.url, { waitUntil: 'domcontentloaded' })
 
     await updateRun(runId, { status: 'waiting' })
-    if (launching.request.readySelector) {
-      await page.locator(launching.request.readySelector).waitFor({ state: 'visible' })
-    }
-    await page.waitForFunction(() => document.fonts.status === 'loaded')
-    await page.waitForFunction(() => Array.from(document.images).every((image) => image.complete))
+    await waitForPageReady(page, launching.request.readySelector, runId)
 
     await updateRun(runId, { status: 'capturing' })
     const screenshotFileName = `${launching.request.outputName}.png`
