@@ -14,6 +14,8 @@
     "@fastify/static": "^8.2.0",
     "@viewport-lab/shared": "workspace:*",
     "fastify": "^5.4.0",
+    "@playwright/cli": "0.1.17",
+    "openai": "^6.48.0",
     "playwright": "^1.53.2"
   },
   "devDependencies": {

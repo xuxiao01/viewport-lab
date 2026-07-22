@@ -31,6 +31,8 @@ import Fastify from 'fastify'
 import { chromium } from 'playwright'
 import type { Page } from 'playwright'
 
+import { agentOutputsDir, registerAgent } from './agent/index.js'
+
 const rootDir = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 const runsDir = resolve(rootDir, 'data/runs')
 
@@ -717,6 +719,13 @@ async function executeRun(runId: string): Promise<void> {
 await mkdir(runsDir, { recursive: true })
 await normalizeInterruptedBatches()
 await app.register(fastifyStatic, { root: runsDir, prefix: '/outputs/' })
+await mkdir(agentOutputsDir, { recursive: true })
+await app.register(fastifyStatic, {
+  root: agentOutputsDir,
+  prefix: '/agent-outputs/',
+  decorateReply: false,
+})
+await registerAgent(app)
 
 app.get<{ Reply: HealthResponse }>('/api/health', async () => ({
   status: 'ok',
