@@ -13,6 +13,7 @@ export default defineConfig(({ mode }) => {
       proxy: {
         '/api': target,
         '/outputs': target,
+        '/agent-outputs': target,
       },
     },
   }

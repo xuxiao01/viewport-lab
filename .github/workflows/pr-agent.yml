@@ -20,11 +20,11 @@ jobs:
         uses: the-pr-agent/pr-agent@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          config.model: "gemini/gemini-3.5-flash"
+          config.model: 'gemini/gemini-3.5-flash'
           GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          github_action_config.auto_review: "true"
-          github_action_config.auto_describe: "true"
-          github_action_config.auto_improve: "false"
+          github_action_config.auto_review: 'true'
+          github_action_config.auto_describe: 'true'
+          github_action_config.auto_improve: 'false'
           pr_reviewer.extra_instructions: >
             请重点从前端工程质量角度审查本次 PR：
             1. TypeScript 类型是否合理，是否存在 any 滥用或类型缺失；
