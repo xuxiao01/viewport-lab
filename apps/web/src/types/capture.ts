@@ -9,10 +9,10 @@ export interface ViewportPreset {
   representativeModels: string[]
   viewport: Viewport
   deviceScaleFactor: number
-  isMobile: true
-  hasTouch: true
-  fullPage: false
-  readySelector: ''
+  isMobile: boolean
+  hasTouch: boolean
+  fullPage: boolean
+  readySelector: string
 }
 
 export interface PlatformPresetGroup {

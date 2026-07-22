@@ -15,6 +15,7 @@ const props = defineProps<{
   detailLoading: boolean
   error: string | null
   retryable: boolean
+  running: boolean
   comparisonCandidates: BatchSummary[]
   baselineBatchId: string | null
   comparisonBatchId: string | null
@@ -23,6 +24,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   select: [batchId: string]
   delete: [batchId: string]
+  rerun: [batchId: string]
   view: [task: CaptureTask]
   retry: [taskId: string]
   'update:baselineBatchId': [batchId: string | null]
@@ -75,6 +77,27 @@ async function confirmDelete(): Promise<void> {
   }
   emit('delete', props.batch.batchId)
 }
+
+async function confirmRerun(): Promise<void> {
+  if (!props.batch || !terminalBatchStatuses.has(props.batch.status) || props.running) return
+  const mode = (props.batch.captureDelayMs ?? 0) === 30_000 ? '额外等待 30 秒' : '默认'
+  try {
+    await ElMessageBox.confirm(
+      `将按原参数重新执行。URL：${props.batch.url}；设备：${props.batch.deviceCount} 个；模式：${mode}。`,
+      '重跑截图批次',
+      {
+        confirmButtonText: '确认重跑',
+        cancelButtonText: '取消',
+        type: 'info',
+      },
+    )
+  } catch {
+    return
+  }
+  emit('rerun', props.batch.batchId)
+}
+
+const terminalBatchStatuses = new Set<BatchStatus>(['completed', 'partial_failed', 'failed'])
 </script>
 
 <template>
@@ -167,14 +190,24 @@ async function confirmDelete(): Promise<void> {
                 </span>
                 <strong>{{ batch.note || '未填写备注' }}</strong>
               </div>
-              <button
-                type="button"
-                class="delete-button"
-                :disabled="batch.status === 'queued' || batch.status === 'running'"
-                @click="confirmDelete"
-              >
-                删除批次
-              </button>
+              <div class="batch-actions">
+                <button
+                  type="button"
+                  class="rerun-button"
+                  :disabled="running || !terminalBatchStatuses.has(batch.status)"
+                  @click="confirmRerun"
+                >
+                  重跑批次
+                </button>
+                <button
+                  type="button"
+                  class="delete-button"
+                  :disabled="batch.status === 'queued' || batch.status === 'running'"
+                  @click="confirmDelete"
+                >
+                  删除批次
+                </button>
+              </div>
             </div>
             <a :href="batch.url" target="_blank" rel="noreferrer" class="target-url">
               {{ batch.url }}
@@ -491,16 +524,32 @@ async function confirmDelete(): Promise<void> {
   background: var(--color-danger-soft);
 }
 
+.batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rerun-button,
 .delete-button {
   padding: 6px 9px;
   border: 1px solid var(--color-border);
   border-radius: 7px;
-  color: var(--color-danger);
   background: #fff;
   font-size: 11px;
   cursor: pointer;
 }
 
+.rerun-button {
+  color: var(--color-primary-dark);
+  border-color: var(--color-primary-border);
+}
+
+.delete-button {
+  color: var(--color-danger);
+}
+
+.rerun-button:disabled,
 .delete-button:disabled {
   color: var(--color-text-muted);
   cursor: not-allowed;
@@ -519,7 +568,7 @@ async function confirmDelete(): Promise<void> {
 
 .batch-stats {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
   margin: 14px 0 0;
 }
@@ -569,6 +618,10 @@ async function confirmDelete(): Promise<void> {
   .detail-title {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .batch-actions {
+    justify-content: flex-end;
   }
 
   .compare-selects {

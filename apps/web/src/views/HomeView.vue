@@ -41,12 +41,16 @@ const resultPlatforms = computed(() =>
 )
 
 async function startBatch(): Promise<void> {
-  await store.startBatch(
-    url.value.trim(),
-    note.value.trim(),
-    effectiveSelectedPresetIds.value,
-    captureDelayMs.value,
-  )
+  try {
+    await store.startBatch(
+      url.value.trim(),
+      note.value.trim(),
+      effectiveSelectedPresetIds.value,
+      captureDelayMs.value,
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '创建截图批次失败')
+  }
 }
 
 function orderCategories(categoryIds: PlatformId[]): PlatformId[] {
@@ -97,6 +101,15 @@ async function deleteBatch(batchId: string): Promise<void> {
   }
 }
 
+async function rerunBatch(batchId: string): Promise<void> {
+  try {
+    await store.rerunBatch(batchId)
+    ElMessage.success('已按原参数创建新的截图批次')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '重跑截图批次失败')
+  }
+}
+
 onMounted(() => {
   void store.loadHistory()
 })
@@ -139,11 +152,13 @@ onMounted(() => {
         :detail-loading="store.detailLoading"
         :error="store.historyError"
         :retryable="store.canRetrySelectedBatch"
+        :running="store.isRunning"
         :comparison-candidates="store.comparisonCandidates"
         :baseline-batch-id="store.comparison.baselineBatchId"
         :comparison-batch-id="store.comparison.comparisonBatchId"
         @select="store.selectBatch"
         @delete="deleteBatch"
+        @rerun="rerunBatch"
         @view="viewScreenshot"
         @retry="store.retryTask"
         @update:baseline-batch-id="store.setBaselineBatch"
