@@ -13,6 +13,9 @@ const route = useRoute()
       <router-link to="/agent" class="app-tab" :class="{ active: route.name === 'agent' }">
         Agent 探索
       </router-link>
+      <router-link to="/batch" class="app-tab" :class="{ active: route.name === 'batch' }">
+        批次重放
+      </router-link>
     </nav>
     <router-view />
   </div>

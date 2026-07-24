@@ -16,3 +16,8 @@ apps/data/agent_runs/
 
 # Legacy
 data/runs/
+
+# Playwright test artifacts
+screenshots/
+test-results/
+playwright-report/

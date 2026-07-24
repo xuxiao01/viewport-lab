@@ -122,6 +122,57 @@ export interface AgentGatewayStatus {
   reason: string | null
 }
 
+export interface RetryScreenshot {
+  stepIndex: number
+  url: string
+}
+
+export interface RetryDeviceResult {
+  deviceId: string
+  presetName: string
+  platformName: string
+  specPath: string
+  status: 'passed' | 'failed' | 'skipped'
+  output: string | null
+  durationMs: number | null
+  error: string | null
+  screenshots: RetryScreenshot[]
+}
+
+export interface RetryRun {
+  retryId: string
+  runId: string
+  startedAt: string
+  completedAt: string
+  status: 'completed' | 'failed'
+  deviceResults: RetryDeviceResult[]
+  error: string | null
+}
+
+export interface RetryRunSummary {
+  retryId: string
+  runId: string
+  startedAt: string
+  completedAt: string
+  status: 'completed' | 'failed'
+  deviceCount: number
+  passedCount: number
+  failedCount: number
+  skippedCount: number
+}
+
+export interface ListRetryRunsResponse {
+  retries: RetryRunSummary[]
+}
+
+export interface GetRetryRunResponse {
+  retry: RetryRun
+}
+
+export interface CreateRetryRunResponse {
+  retry: RetryRun
+}
+
 export type AgentEvent =
   | { type: 'status'; run: AgentRun }
   | {

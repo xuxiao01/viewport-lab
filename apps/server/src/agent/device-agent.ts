@@ -4,6 +4,7 @@ import type {
   DeviceAgentStep,
   ScreenshotDevicePresetSnapshot,
 } from '@viewport-lab/shared'
+import { writeFile } from 'node:fs/promises'
 
 import type { AgentCliBridge } from './cli-bridge.js'
 import { sanitizeSessionId } from './cli-bridge.js'
@@ -13,8 +14,13 @@ import type { DeviceLlmClient } from './llm-client.js'
 import { createDeviceLlmClient } from './llm-client.js'
 import type { RecordedStep } from './test-script-generator.js'
 import { generateSpec } from './test-script-generator.js'
+import { sanitizeDeviceDir } from './recorder.js'
 
 const SCREENSHOT_DELAY_MS = 500
+
+function snapshotFilePath(dir: string, stepIndex: number): string {
+  return `${dir}/${String(stepIndex).padStart(2, '0')}.txt`
+}
 
 export interface DeviceAgentDeps {
   device: ScreenshotDevicePresetSnapshot
@@ -35,6 +41,7 @@ export interface DeviceAgentDeps {
 export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgentRun> {
   const { device, url, task, maxTurns, runId, gatewayConfig, cliBridge } = deps
   const deviceId = device.selectionId
+  const safeDeviceId = sanitizeDeviceDir(deviceId)
   const mapping = mapToDevice(device)
   const session = sanitizeSessionId(`agent-${runId.slice(0, 8)}-${deviceId}`)
   const steps: DeviceAgentStep[] = []
@@ -67,6 +74,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
 
     const snapshotResult = await cliBridge.snapshot(session)
     const initialSnapshot = snapshotResult.ok ? snapshotResult.output : '(snapshot unavailable)'
+    await writeFile(snapshotFilePath(deps.snapshotsDir, 0), initialSnapshot, 'utf8')
 
     const initialShotPath = `${deps.screenshotsDir}/00.png`
     await cliBridge.screenshot(session, initialShotPath)
@@ -79,8 +87,8 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
       status: 'success',
       info: null,
       output: null,
-      snapshot: null,
-      screenshotUrl: `/agent-outputs/${runId}/${deviceId}/screenshots/00.png`,
+      snapshot: initialSnapshot,
+      screenshotUrl: `/agent-outputs/${runId}/${safeDeviceId}/screenshots/00.png`,
       locator: null,
       startedAt: new Date(startedAt).toISOString(),
       completedAt: new Date().toISOString(),
@@ -113,6 +121,9 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
       const stepStartedAt = new Date().toISOString()
       const result = await cliBridge.execute(session, command, next.args)
       const stepCompletedAt = new Date().toISOString()
+      if (command === 'snapshot' && result.output) {
+        await writeFile(snapshotFilePath(deps.snapshotsDir, stepIndex), result.output, 'utf8')
+      }
 
       let screenshotUrl: string | null = null
       if (command !== 'snapshot' && command !== 'find') {
@@ -121,7 +132,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
         const shotPath = `${deps.screenshotsDir}/${String(stepIndex).padStart(2, '0')}.png`
         const shotResult = await cliBridge.screenshot(session, shotPath)
         if (shotResult.ok) {
-          screenshotUrl = `/agent-outputs/${runId}/${deviceId}/screenshots/${String(stepIndex).padStart(2, '0')}.png`
+          screenshotUrl = `/agent-outputs/${runId}/${safeDeviceId}/screenshots/${String(stepIndex).padStart(2, '0')}.png`
         }
       }
 
@@ -184,10 +195,9 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
     }
 
     const specContent = generateSpec(device, url, task, recordedSteps)
-    const { writeFile } = await import('node:fs/promises')
-    const specPath = `${deps.specDir}/spec.ts`
+    const specPath = `${deps.specDir}/agent.spec.ts`
     await writeFile(specPath, specContent, 'utf8')
-    deviceRun.testScriptUrl = `/agent-outputs/${runId}/${deviceId}/spec.ts`
+    deviceRun.testScriptUrl = `/agent-outputs/${runId}/${safeDeviceId}/agent.spec.ts`
 
     deviceRun.status = deviceRun.summary ? 'completed' : 'completed'
     deviceRun.durationMs = Date.now() - startedAt

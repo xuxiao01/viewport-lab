@@ -7,11 +7,17 @@ import type {
   AgentRunStatus,
   DeviceAgentRun,
   DeviceAgentStep,
+  RetryRun,
+  RetryRunSummary,
 } from '@viewport-lab/shared'
 
 import { agentRunsDir } from './config.js'
 
 const runIdPattern = /^[0-9a-f-]{36}$/i
+
+export function sanitizeDeviceDir(deviceId: string): string {
+  return deviceId.replace(/:/g, '-')
+}
 
 function nowIso(): string {
   return new Date().toISOString()
@@ -31,7 +37,8 @@ export async function ensureRunDirs(runId: string): Promise<AgentRunPersisted> {
 
 export async function ensureDeviceDirs(runId: string, deviceId: string): Promise<DeviceRunDirs> {
   const runDir = resolve(agentRunsDir, runId)
-  const deviceDir = resolve(runDir, deviceId)
+  const safeId = sanitizeDeviceDir(deviceId)
+  const deviceDir = resolve(runDir, safeId)
   const screenshotsDir = resolve(deviceDir, 'screenshots')
   const snapshotsDir = resolve(deviceDir, 'snapshots')
   const specDir = deviceDir
@@ -150,4 +157,97 @@ export async function listAgentRuns(): Promise<AgentRun[]> {
   return runs
     .filter((run): run is AgentRun => run !== null)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+}
+
+const retryIdPattern = /^[0-9a-f-]{36}$/i
+
+function retriesDir(runId: string): string {
+  return resolve(agentRunsDir, runId, 'retries')
+}
+
+function retryManifestPath(runId: string, retryId: string): string {
+  return resolve(retriesDir(runId), retryId, 'manifest.json')
+}
+
+export async function writeRetryRun(retry: RetryRun): Promise<void> {
+  if (!runIdPattern.test(retry.runId)) return
+  const dir = resolve(retriesDir(retry.runId), retry.retryId)
+  await mkdir(dir, { recursive: true })
+  await writeFile(
+    retryManifestPath(retry.runId, retry.retryId),
+    `${JSON.stringify(retry, null, 2)}\n`,
+    'utf8',
+  )
+}
+
+export async function readRetryRun(runId: string, retryId: string): Promise<RetryRun | null> {
+  if (!runIdPattern.test(runId) || !retryIdPattern.test(retryId)) return null
+  try {
+    const contents = await readFile(retryManifestPath(runId, retryId), 'utf8')
+    return JSON.parse(contents) as RetryRun
+  } catch {
+    return null
+  }
+}
+
+export function toRetrySummary(retry: RetryRun): RetryRunSummary {
+  const passed = retry.deviceResults.filter((d) => d.status === 'passed').length
+  const failed = retry.deviceResults.filter((d) => d.status === 'failed').length
+  const skipped = retry.deviceResults.filter((d) => d.status === 'skipped').length
+  return {
+    retryId: retry.retryId,
+    runId: retry.runId,
+    startedAt: retry.startedAt,
+    completedAt: retry.completedAt,
+    status: retry.status,
+    deviceCount: retry.deviceResults.length,
+    passedCount: passed,
+    failedCount: failed,
+    skippedCount: skipped,
+  }
+}
+
+export async function listRetryRuns(runId: string): Promise<RetryRunSummary[]> {
+  if (!runIdPattern.test(runId)) return []
+  let entries: Dirent[]
+  try {
+    entries = await readdir(retriesDir(runId), { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const retries = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && retryIdPattern.test(entry.name))
+      .map((entry) => readRetryRun(runId, entry.name)),
+  )
+  return retries
+    .filter((retry): retry is RetryRun => retry !== null)
+    .map(toRetrySummary)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
+}
+
+export async function ensureRetryDeviceDir(
+  runId: string,
+  retryId: string,
+  deviceId: string,
+): Promise<string> {
+  const safeId = sanitizeDeviceDir(deviceId)
+  const dir = resolve(retriesDir(runId), retryId, safeId, 'screenshots')
+  await mkdir(dir, { recursive: true })
+  return resolve(retriesDir(runId), retryId, safeId)
+}
+
+export async function listRetryScreenshots(
+  runId: string,
+  retryId: string,
+  deviceId: string,
+): Promise<string[]> {
+  const safeId = sanitizeDeviceDir(deviceId)
+  const dir = resolve(retriesDir(runId), retryId, safeId, 'screenshots')
+  try {
+    const files = await readdir(dir)
+    return files.filter((f) => f.endsWith('.png')).sort()
+  } catch {
+    return []
+  }
 }

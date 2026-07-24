@@ -18,7 +18,7 @@ const store = useAgentStore()
 const url = ref('http://localhost:5188')
 const task = ref('')
 const note = ref('')
-const maxTurns = ref(12)
+const maxTurns = ref(50)
 const selectedCategories = ref<PlatformId[]>(['ios-phone'])
 const activeCategory = ref<PlatformId | null>('ios-phone')
 const selectedPresetIds = ref<string[]>([...defaultSelectedPresetIds])
@@ -95,9 +95,11 @@ function formatSummary(summary: AgentRunSummary): string {
   return `${devices} · ${steps}${duration}`
 }
 
+const screenshotMode = ref<'compact' | 'full'>('compact')
+
 function lastScreenshot(dr: DeviceAgentRun): string | null {
-  for (let i = dr.steps.length - 1; i >= 0; i--) {
-    if (dr.steps[i]!.screenshotUrl) return dr.steps[i]!.screenshotUrl
+  for (const step of [...dr.steps].reverse()) {
+    if (step.screenshotUrl) return step.screenshotUrl
   }
   return null
 }
@@ -168,7 +170,15 @@ onMounted(() => {
       </section>
 
       <section v-if="store.currentRun" class="surface-card panel">
-        <h2>当前运行</h2>
+        <div class="run-header-row">
+          <h2>当前运行</h2>
+          <el-button
+            size="small"
+            @click="screenshotMode = screenshotMode === 'compact' ? 'full' : 'compact'"
+          >
+            {{ screenshotMode === 'compact' ? '展开全部截图' : '收起截图' }}
+          </el-button>
+        </div>
         <div class="run-meta">
           <span>状态: {{ store.currentRun.status }}</span>
           <span
@@ -189,23 +199,52 @@ onMounted(() => {
               <span class="device-cli">{{ dr.cliDeviceName }}</span>
             </div>
             <div v-if="dr.error" class="device-error">{{ dr.error }}</div>
-            <div v-if="lastScreenshot(dr)" class="device-screenshot">
-              <img :src="lastScreenshot(dr) ?? undefined" :alt="dr.presetName" loading="lazy" />
+
+            <div
+              v-if="screenshotMode === 'compact' && lastScreenshot(dr)"
+              class="device-screenshot"
+            >
+              <span class="device-screenshot-label">最新截图</span>
+              <img
+                :src="lastScreenshot(dr) ?? undefined"
+                :alt="`${dr.presetName} 最新截图`"
+                loading="lazy"
+              />
             </div>
-            <div class="device-steps">
+
+            <div :class="['device-steps', { expanded: screenshotMode === 'full' }]">
               <div v-for="step in dr.steps" :key="step.stepIndex" class="device-step">
-                <span class="step-index">#{{ step.stepIndex }}</span>
-                <span class="step-cmd">{{ step.command }}</span>
-                <span :class="['step-status', step.status]">{{ step.status }}</span>
-                <span v-if="step.info" class="step-intent">{{ step.info.intent }}</span>
+                <div class="step-main">
+                  <span class="step-index">#{{ step.stepIndex }}</span>
+                  <span class="step-cmd">{{ step.command }}</span>
+                  <span :class="['step-status', step.status]">{{ step.status }}</span>
+                  <span v-if="step.info" class="step-intent">{{ step.info.intent }}</span>
+                  <a
+                    v-if="step.screenshotUrl && screenshotMode === 'compact'"
+                    :href="step.screenshotUrl"
+                    target="_blank"
+                    class="step-shot-link"
+                    >截图</a
+                  >
+                </div>
                 <a
-                  v-if="step.screenshotUrl"
+                  v-if="screenshotMode === 'full' && step.screenshotUrl"
                   :href="step.screenshotUrl"
                   target="_blank"
-                  class="step-shot-link"
-                  >截图</a
+                  class="step-shot"
+                  :aria-label="`${dr.presetName} 第 ${step.stepIndex} 步截图`"
                 >
+                  <img
+                    :src="step.screenshotUrl"
+                    :alt="`${dr.presetName} #${step.stepIndex}`"
+                    loading="lazy"
+                  />
+                </a>
+                <div v-else-if="screenshotMode === 'full'" class="step-shot-placeholder">
+                  该步骤暂无截图
+                </div>
               </div>
+              <div v-if="dr.steps.length === 0" class="empty-state">暂无步骤</div>
             </div>
             <div v-if="dr.testScriptUrl" class="device-spec">
               <a :href="dr.testScriptUrl" target="_blank">spec.ts</a>
@@ -265,6 +304,17 @@ onMounted(() => {
   font-size: 18px;
   font-weight: 700;
   color: var(--color-text-strong);
+}
+
+.run-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.run-header-row h2 {
+  margin: 0;
 }
 
 .gateway-ok {
@@ -372,6 +422,17 @@ onMounted(() => {
   background: var(--color-danger-soft);
 }
 
+.device-screenshot {
+  display: grid;
+  gap: 6px;
+}
+
+.device-screenshot-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
 .device-screenshot img {
   width: 100%;
   max-width: 280px;
@@ -385,12 +446,36 @@ onMounted(() => {
   gap: 4px;
 }
 
+.device-steps.expanded {
+  max-height: 560px;
+  overflow-y: auto;
+  padding-right: 4px;
+  gap: 10px;
+}
+
 .device-step {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
   font-size: 12px;
+}
+
+.device-steps.expanded .device-step {
+  display: grid;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  background: var(--color-surface);
+}
+
+.step-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .step-index {
@@ -423,6 +508,27 @@ onMounted(() => {
 .step-shot-link {
   color: var(--color-primary);
   font-size: 11px;
+}
+
+.step-shot {
+  display: block;
+}
+
+.step-shot img {
+  width: 100%;
+  max-width: 280px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  display: block;
+}
+
+.step-shot-placeholder {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  padding: 10px 12px;
+  border: 1px dashed var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-subtle);
 }
 
 .device-spec a {

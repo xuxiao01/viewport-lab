@@ -15,7 +15,7 @@ export function generateSpec(
 ): string {
   const deviceLabel = `${device.platformName} ${device.presetName}`
   const lines: string[] = [
-    `import { test, expect } from '@playwright/test'`,
+    `import { test } from '@playwright/test'`,
     '',
     `test.use({`,
     `  viewport: { width: ${device.viewport.width}, height: ${device.viewport.height} },`,
@@ -39,6 +39,7 @@ export function generateSpec(
     if (step.command !== 'snapshot' && step.command !== 'find') {
       screenshotIndex++
       lines.push(
+        `    await page.waitForTimeout(2000)`,
         `    await page.screenshot({ path: 'screenshots/${String(screenshotIndex).padStart(2, '0')}.png' })`,
       )
     }
