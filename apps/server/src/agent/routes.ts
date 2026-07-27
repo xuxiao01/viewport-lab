@@ -1,0 +1,363 @@
+import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { readdir, rm } from 'node:fs/promises'
+import { resolve } from 'node:path'
+
+import type {
+  AgentGatewayStatus,
+  AgentRun,
+  AgentRunSummary,
+  CreateAgentRunRequest,
+  CreateAgentRunResponse,
+  CreateRetryRunResponse,
+  GetAgentRunResponse,
+  GetRetryRunResponse,
+  ListAgentRunsResponse,
+  ListRetryRunsResponse,
+  RetryDeviceResult,
+  RetryRun,
+  RetryScreenshot,
+} from '@viewport-lab/shared'
+import type { AgentEvent } from '@viewport-lab/shared'
+import type { FastifyInstance } from 'fastify'
+
+import { agentGatewayStatus, agentOutputsDir, agentRunsDir } from './config.js'
+import {
+  ensureRetryDeviceDir,
+  listAgentRuns,
+  listRetryRuns,
+  listRetryScreenshots,
+  readAgentRun,
+  readRetryRun,
+  sanitizeDeviceDir,
+  writeRetryRun,
+} from './recorder.js'
+import { startAgentRun } from './runner.js'
+import type { AgentEventSink } from './runner.js'
+
+type Subscriber = (event: AgentEvent) => void
+const subscribers = new Map<string, Set<Subscriber>>()
+
+export function publishAgentEvent(event: AgentEvent): void {
+  const runId =
+    event.type === 'log' ? event.runId : event.type === 'status' ? event.run.runId : event.runId
+  for (const subscriber of subscribers.get(runId) ?? []) subscriber(event)
+}
+
+const emit: AgentEventSink = publishAgentEvent
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsedUrl = new URL(value)
+    return parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function toRunSummary(run: AgentRun): AgentRunSummary {
+  const completedDeviceCount = run.deviceRuns.filter((dr) => dr.status === 'completed').length
+  const stepCount = run.deviceRuns.reduce((sum, dr) => sum + dr.steps.length, 0)
+  return {
+    runId: run.runId,
+    createdAt: run.createdAt,
+    completedAt: run.completedAt,
+    status: run.status,
+    url: run.url,
+    task: run.task,
+    deviceCount: run.devices.length,
+    completedDeviceCount,
+    stepCount,
+    durationMs: run.durationMs,
+  }
+}
+
+function parseCreateAgentRunRequest(body: unknown): CreateAgentRunRequest | null {
+  if (typeof body !== 'object' || body === null) return null
+  const value = body as Record<string, unknown>
+  const { url, task, note, devices, maxTurns } = value
+  if (
+    typeof url !== 'string' ||
+    !isHttpUrl(url) ||
+    typeof task !== 'string' ||
+    task.trim().length === 0 ||
+    typeof note !== 'string' ||
+    note.length > 200 ||
+    !Array.isArray(devices) ||
+    devices.length === 0 ||
+    devices.length > 20 ||
+    typeof maxTurns !== 'number' ||
+    !Number.isInteger(maxTurns) ||
+    maxTurns < 1 ||
+    maxTurns > 100
+  ) {
+    return null
+  }
+  return {
+    url,
+    task: task.trim(),
+    note: note.trim(),
+    devices: devices as CreateAgentRunRequest['devices'],
+    maxTurns,
+  }
+}
+
+const terminalStatuses = new Set(['completed', 'failed', 'cancelled'])
+
+function isRunTerminal(run: AgentRun): boolean {
+  return terminalStatuses.has(run.status)
+}
+
+async function retryRunSpecs(runId: string): Promise<RetryRun> {
+  const retryId = randomUUID()
+  const startedAt = new Date().toISOString()
+  const runDir = resolve(agentRunsDir, runId)
+  const projectRoot = resolve(agentRunsDir, '..', '..', '..', '..')
+  const configPath = resolve(projectRoot, 'playwright.config.ts')
+  const deviceResults: RetryDeviceResult[] = []
+
+  let entries: { name: string; isDirectory: () => boolean }[]
+  try {
+    const raw = await readdir(runDir, { withFileTypes: true })
+    entries = raw.filter((e) => e.isDirectory() && e.name !== 'retries')
+  } catch {
+    const retry: RetryRun = {
+      retryId,
+      runId,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      status: 'failed',
+      deviceResults: [],
+      error: `Run ${runId} 目录不存在`,
+    }
+    await writeRetryRun(retry)
+    return retry
+  }
+
+  const deviceMetaMap = new Map<string, { presetName: string; platformName: string }>()
+  try {
+    const run = await readAgentRun(runId)
+    if (run) {
+      for (const dr of run.deviceRuns) {
+        deviceMetaMap.set(sanitizeDeviceDir(dr.deviceId), {
+          presetName: dr.presetName,
+          platformName: run.devices.find((d) => d.selectionId === dr.deviceId)?.platformName ?? '',
+        })
+      }
+    }
+  } catch {
+    // fallback to directory name
+  }
+
+  for (const entry of entries) {
+    const safeDeviceId = entry.name
+    const specPath = resolve(runDir, safeDeviceId, 'agent.spec.ts')
+    const meta = deviceMetaMap.get(safeDeviceId) ?? {
+      presetName: safeDeviceId,
+      platformName: '',
+    }
+
+    try {
+      const { access } = await import('node:fs/promises')
+      await access(specPath)
+    } catch {
+      deviceResults.push({
+        deviceId: safeDeviceId,
+        presetName: meta.presetName,
+        platformName: meta.platformName,
+        specPath,
+        status: 'skipped',
+        output: null,
+        durationMs: null,
+        error: null,
+        screenshots: [],
+      })
+      continue
+    }
+
+    const retryDeviceDir = await ensureRetryDeviceDir(runId, retryId, safeDeviceId)
+
+    const deviceStartedAt = Date.now()
+    let status: 'passed' | 'failed' = 'passed'
+    let output: string | null = null
+    let errorMsg: string | null = null
+
+    try {
+      const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>(
+        (resolveP, rejectP) => {
+          execFile(
+            'npx',
+            ['playwright', 'test', specPath, `--config=${configPath}`],
+            {
+              cwd: retryDeviceDir,
+              timeout: 120_000,
+              maxBuffer: 1024 * 1024 * 2,
+              encoding: 'utf8',
+            },
+            (err, stdout, stderr) => {
+              if (err) {
+                rejectP(err)
+              } else {
+                resolveP({ stdout: stdout as string, stderr: stderr as string })
+              }
+            },
+          )
+        },
+      )
+      output = `${stdout}\n${stderr}`.trim().slice(0, 8000)
+    } catch (err) {
+      status = 'failed'
+      const message = err instanceof Error ? err.message : String(err)
+      output = message.slice(0, 8000)
+      errorMsg = message.slice(0, 500)
+    }
+
+    const shotFiles = await listRetryScreenshots(runId, retryId, safeDeviceId)
+    const screenshots: RetryScreenshot[] = shotFiles.map((fname) => {
+      const stepIndex = parseInt(fname.replace('.png', ''), 10) || 0
+      return {
+        stepIndex,
+        url: `/agent-outputs/${runId}/retries/${retryId}/${safeDeviceId}/screenshots/${fname}`,
+      }
+    })
+
+    deviceResults.push({
+      deviceId: safeDeviceId,
+      presetName: meta.presetName,
+      platformName: meta.platformName,
+      specPath,
+      status,
+      output,
+      durationMs: Date.now() - deviceStartedAt,
+      error: errorMsg,
+      screenshots,
+    })
+  }
+
+  const hasFailures = deviceResults.some((d) => d.status === 'failed')
+  const retry: RetryRun = {
+    retryId,
+    runId,
+    startedAt,
+    completedAt: new Date().toISOString(),
+    status: hasFailures ? 'failed' : 'completed',
+    deviceResults,
+    error: null,
+  }
+  await writeRetryRun(retry)
+  return retry
+}
+
+export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
+  app.get<{ Reply: AgentGatewayStatus }>('/api/agent/gateway-status', async () =>
+    agentGatewayStatus(),
+  )
+
+  app.get<{ Reply: ListAgentRunsResponse }>('/api/agent/runs', async () => ({
+    runs: (await listAgentRuns()).map(toRunSummary),
+  }))
+
+  app.get<{ Params: { runId: string }; Reply: GetAgentRunResponse | { error: string } }>(
+    '/api/agent/runs/:runId',
+    async (request, reply) => {
+      const run = await readAgentRun(request.params.runId)
+      if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+      return reply.send({ run })
+    },
+  )
+
+  app.post<{ Body: unknown; Reply: CreateAgentRunResponse | { error: string } }>(
+    '/api/agent/runs',
+    async (request, reply) => {
+      const parsed = parseCreateAgentRunRequest(request.body)
+      if (!parsed) {
+        return reply.code(400).send({ error: 'Invalid agent run request' })
+      }
+      const run = await startAgentRun({
+        url: parsed.url,
+        task: parsed.task,
+        note: parsed.note,
+        devices: parsed.devices,
+        maxTurns: parsed.maxTurns,
+        emit,
+      })
+      return reply.code(201).send({ run })
+    },
+  )
+
+  app.delete<{ Params: { runId: string } }>('/api/agent/runs/:runId', async (request, reply) => {
+    const { runId } = request.params
+    const run = await readAgentRun(runId)
+    if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+    subscribers.delete(runId)
+    await rm(resolve(agentOutputsDir, runId), { recursive: true })
+    return reply.code(204).send()
+  })
+
+  app.get<{ Params: { runId: string }; Reply: ListRetryRunsResponse }>(
+    '/api/agent/runs/:runId/retries',
+    async (request) => ({
+      retries: await listRetryRuns(request.params.runId),
+    }),
+  )
+
+  app.get<{
+    Params: { runId: string; retryId: string }
+    Reply: GetRetryRunResponse | { error: string }
+  }>('/api/agent/runs/:runId/retries/:retryId', async (request, reply) => {
+    const retry = await readRetryRun(request.params.runId, request.params.retryId)
+    if (!retry) return reply.code(404).send({ error: 'Retry run not found' })
+    return reply.send({ retry })
+  })
+
+  app.post<{ Params: { runId: string }; Reply: CreateRetryRunResponse | { error: string } }>(
+    '/api/agent/runs/:runId/retry',
+    async (request, reply) => {
+      const result = await retryRunSpecs(request.params.runId)
+      return reply.code(201).send({ retry: result })
+    },
+  )
+
+  app.get<{ Params: { runId: string } }>(
+    '/api/agent/runs/:runId/events',
+    async (request, reply) => {
+      const { runId } = request.params
+      const run = await readAgentRun(runId)
+      if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+
+      reply.hijack()
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      })
+
+      let ended = false
+      const writeEvent = (event: AgentEvent): void => {
+        if (ended) return
+        reply.raw.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+        if (event.type === 'status' && isRunTerminal(event.run)) {
+          reply.raw.end()
+          ended = true
+        }
+        if (event.type === 'device_completed' && isRunTerminal(event.run)) {
+          reply.raw.end()
+          ended = true
+        }
+      }
+
+      writeEvent({ type: 'status', run })
+      if (isRunTerminal(run)) {
+        return
+      }
+
+      const runSubscribers = subscribers.get(runId) ?? new Set<Subscriber>()
+      runSubscribers.add(writeEvent)
+      subscribers.set(runId, runSubscribers)
+      request.raw.on('close', () => {
+        runSubscribers.delete(writeEvent)
+        if (runSubscribers.size === 0) subscribers.delete(runId)
+      })
+    },
+  )
+}
