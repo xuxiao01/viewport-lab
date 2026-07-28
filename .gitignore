@@ -8,7 +8,17 @@ dist/
 *.log
 *.tsbuildinfo
 
-data/runs/*
-!data/runs/.gitkeep
+# Playwright CLI sessions (console logs, page state)
+apps/server/.playwright-cli/
 
-.cursor
+# Screenshot and Agent run archives
+data/runs/
+data/configurations/
+
+# Playwright test artifacts
+screenshots/
+test-results/
+playwright-report/
+
+# Local-only internal documentation
+local-doc/

@@ -22,6 +22,8 @@ import type {
   CreateRunResponse,
   HealthResponse,
   ListBatchesResponse,
+  RerunBatchRequest,
+  RerunBatchResponse,
   RunEvent,
   RunManifest,
   ScreenshotDevicePresetSnapshot,
@@ -30,6 +32,10 @@ import type {
 import Fastify from 'fastify'
 import { chromium } from 'playwright'
 import type { Page } from 'playwright'
+
+import { registerAgent } from './agent/index.js'
+import { archiveIdPattern, createArchiveId } from './run-archive.js'
+import { registerTestConfigurationRoutes } from './test-configurations.js'
 
 const rootDir = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 const runsDir = resolve(rootDir, 'data/runs')
@@ -50,7 +56,6 @@ const batches = new Map<string, BatchManifest>()
 const batchWriteQueues = new Map<string, Promise<void>>()
 const batchUpdateQueues = new Map<string, Promise<void>>()
 const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
-const batchIdPattern = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}_[0-9a-f]{8}$/i
 const runIdPattern = /^[0-9a-f-]{36}$/i
 const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
 const selectionIdPattern = /^[a-z0-9][a-z0-9:-]{0,127}$/
@@ -65,16 +70,6 @@ const readinessTiming = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
-}
-
-function createBatchId(date: Date): string {
-  const pad = (value: number, length = 2): string => String(value).padStart(length, '0')
-  const timestamp = [
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
-    `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}-${pad(date.getMilliseconds(), 3)}`,
-  ].join('_')
-
-  return `${timestamp}_${randomUUID().slice(0, 8)}`
 }
 
 function isHttpUrl(value: string): boolean {
@@ -199,7 +194,7 @@ function parseCreateRunRequest(value: unknown): CreateRunRequest | null {
   } = value
   if (
     typeof batchId !== 'string' ||
-    !batchIdPattern.test(batchId) ||
+    !archiveIdPattern.test(batchId) ||
     typeof selectionId !== 'string' ||
     !selectionIdPattern.test(selectionId) ||
     typeof outputName !== 'string' ||
@@ -297,10 +292,15 @@ async function persistBatch(batch: BatchManifest): Promise<void> {
 async function readBatch(batchId: string): Promise<BatchManifest | null> {
   const memoryBatch = batches.get(batchId)
   if (memoryBatch) return memoryBatch
-  if (!batchIdPattern.test(batchId)) return null
+  if (!archiveIdPattern.test(batchId)) return null
   try {
     const contents = await readFile(batchManifestPath(batchId), 'utf8')
-    const batch = JSON.parse(contents) as BatchManifest
+    const parsed = JSON.parse(contents) as { kind?: string }
+    if (parsed.kind === 'agent') return null
+    const batch: BatchManifest = {
+      ...(parsed as unknown as Omit<BatchManifest, 'kind'>),
+      kind: 'viewport',
+    }
     if (batch.batchId !== batchId || !Array.isArray(batch.devices)) return null
     batches.set(batchId, batch)
     return batch
@@ -324,6 +324,7 @@ function toBatchSummary(batch: BatchManifest): BatchSummary {
     failedCount,
   } = batch
   return {
+    kind: 'viewport',
     batchId,
     createdAt,
     completedAt,
@@ -342,7 +343,7 @@ async function listBatches(): Promise<BatchManifest[]> {
   const entries = await readdir(runsDir, { withFileTypes: true })
   const loaded = await Promise.all(
     entries
-      .filter((entry) => entry.isDirectory() && batchIdPattern.test(entry.name))
+      .filter((entry) => entry.isDirectory() && archiveIdPattern.test(entry.name))
       .map((entry) => readBatch(entry.name)),
   )
   return loaded
@@ -717,6 +718,8 @@ async function executeRun(runId: string): Promise<void> {
 await mkdir(runsDir, { recursive: true })
 await normalizeInterruptedBatches()
 await app.register(fastifyStatic, { root: runsDir, prefix: '/outputs/' })
+await registerAgent(app)
+await registerTestConfigurationRoutes(app)
 
 app.get<{ Reply: HealthResponse }>('/api/health', async () => ({
   status: 'ok',
@@ -731,7 +734,7 @@ app.post<{ Body: unknown; Reply: CreateBatchResponse | ApiErrorResponse }>(
 
     const createdAt = new Date()
     const now = createdAt.toISOString()
-    const batchId = createBatchId(createdAt)
+    const batchId = createArchiveId(createdAt)
     const devices = parsed.devices.map<ScreenshotDeviceRun>((device) => ({
       ...device,
       runId: null,
@@ -744,6 +747,7 @@ app.post<{ Body: unknown; Reply: CreateBatchResponse | ApiErrorResponse }>(
       error: null,
     }))
     const batch: BatchManifest = {
+      kind: 'viewport',
       batchId,
       createdAt: now,
       updatedAt: now,
@@ -783,6 +787,73 @@ app.get<{
   const batch = await readBatch(request.params.batchId)
   if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
   return reply.send(batch)
+})
+
+app.post<{
+  Params: { batchId: string }
+  Body: unknown
+  Reply: RerunBatchResponse | ApiErrorResponse
+}>('/api/batches/:batchId/rerun', async (request, reply) => {
+  const body = request.body as Partial<RerunBatchRequest> | null
+  const scope = body?.scope
+  if (scope !== 'all' && scope !== 'failed') {
+    return reply.code(400).send({ error: 'Invalid rerun scope' })
+  }
+
+  const { batchId } = request.params
+  await batchUpdateQueues.get(batchId)
+  await batchWriteQueues.get(batchId)
+  const batch = await readBatch(batchId)
+  if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
+  if (!isTerminalBatchStatus(batch.status)) {
+    return reply.code(409).send({ error: '只能重跑已结束的截图批次' })
+  }
+
+  const selectedDevices =
+    scope === 'failed'
+      ? batch.devices.filter((device) => device.status === 'failed')
+      : batch.devices
+  if (selectedDevices.length === 0) {
+    return reply.code(409).send({ error: '当前批次没有失败设备' })
+  }
+
+  const selectionIds = selectedDevices.map((device) => device.selectionId)
+  const selectedIdSet = new Set(selectionIds)
+  const rerunAt = new Date().toISOString()
+  for (const device of selectedDevices) {
+    if (device.runId) {
+      runs.delete(device.runId)
+      subscribers.delete(device.runId)
+    }
+    await rm(resolve(runsDir, batchId, `${device.presetId}.png`), { force: true })
+  }
+  const devices = batch.devices.map<ScreenshotDeviceRun>((device) =>
+    selectedIdSet.has(device.selectionId)
+      ? {
+          ...device,
+          runId: null,
+          status: 'queued',
+          createdAt: rerunAt,
+          updatedAt: rerunAt,
+          completedAt: null,
+          screenshotPath: null,
+          screenshotUrl: null,
+          error: null,
+        }
+      : device,
+  )
+  const updated = aggregateBatch({ ...batch, devices, completedAt: null }, rerunAt)
+  batches.set(batchId, updated)
+  await persistBatch(updated)
+
+  const registrationTimer = setTimeout(() => {
+    void failUnregisteredDevices(batchId).catch((error: unknown) => {
+      app.log.error({ err: error, batchId }, 'Failed to finalize rerun screenshot devices')
+    })
+  }, runRegistrationTimeout)
+  registrationTimer.unref()
+
+  return reply.send({ batch: updated, selectionIds })
 })
 
 app.delete<{ Params: { batchId: string } }>('/api/batches/:batchId', async (request, reply) => {

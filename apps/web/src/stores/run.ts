@@ -9,6 +9,8 @@ import type {
   CreateRunRequest,
   CreateRunResponse,
   ListBatchesResponse,
+  RerunBatchResponse,
+  RerunScope,
   RunEvent,
   RunManifest,
   RunStatus,
@@ -16,12 +18,13 @@ import type {
   ScreenshotDevicePresetSnapshot,
   ScreenshotDeviceRun,
 } from '@viewport-lab/shared'
-import { defineStore } from 'pinia'
+import { acceptHMRUpdate, defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { getPresetSelectionId, viewportPresets } from '../config/viewport-presets'
 import type {
   CaptureTask,
+  PlatformId,
   PlatformCaptureStatus,
   PlatformProgressItem,
   ViewportPreset,
@@ -45,6 +48,7 @@ function toBatchSummary(batch: BatchManifest): BatchSummary {
     failedCount,
   } = batch
   return {
+    kind: 'viewport',
     batchId,
     createdAt,
     completedAt,
@@ -122,14 +126,56 @@ function taskFromDevice(batch: BatchManifest, device: ScreenshotDeviceRun): Capt
       representativeModels: [],
       viewport: device.viewport,
       deviceScaleFactor: device.deviceScaleFactor,
-      isMobile: true,
-      hasTouch: true,
-      fullPage: false,
-      readySelector: '',
+      isMobile: device.isMobile,
+      hasTouch: device.hasTouch,
+      fullPage: device.fullPage,
+      readySelector: device.readySelector,
     },
     status: device.status,
     run: runFromDevice(batch, device),
     error: device.error,
+  }
+}
+
+function normalizeDeviceSnapshot(
+  device: ScreenshotDevicePresetSnapshot | ScreenshotDeviceRun,
+  captureDelayMs: CaptureDelayMs,
+): ScreenshotDevicePresetSnapshot {
+  return {
+    selectionId: device.selectionId,
+    platformId: device.platformId,
+    platformName: device.platformName,
+    presetId: device.presetId,
+    presetName: device.presetName,
+    viewport: { ...device.viewport },
+    deviceScaleFactor: device.deviceScaleFactor,
+    isMobile: device.isMobile,
+    hasTouch: device.hasTouch,
+    fullPage: device.fullPage,
+    readySelector: device.readySelector,
+    captureDelayMs: device.captureDelayMs ?? captureDelayMs,
+  }
+}
+
+function queuedTaskFromSnapshot(device: ScreenshotDevicePresetSnapshot): CaptureTask {
+  return {
+    id: device.selectionId,
+    platformId: device.platformId,
+    preset: {
+      id: device.presetId,
+      name: device.presetName,
+      description: '',
+      representativeModels: [],
+      viewport: { ...device.viewport },
+      deviceScaleFactor: device.deviceScaleFactor,
+      isMobile: device.isMobile,
+      hasTouch: device.hasTouch,
+      fullPage: device.fullPage,
+      readySelector: device.readySelector,
+    },
+    status: 'queued',
+    run: null,
+    error: null,
   }
 }
 
@@ -161,11 +207,12 @@ export const useRunStore = defineStore('run', () => {
     totalCount.value === 0 ? 0 : Math.round((completedCount.value / totalCount.value) * 100),
   )
   const isRunning = computed(() => tasks.value.some((task) => !terminalStatuses.has(task.status)))
-  const selectedTasks = computed(() =>
-    selectedBatch.value
-      ? selectedBatch.value.devices.map((device) => taskFromDevice(selectedBatch.value!, device))
-      : [],
-  )
+  const selectedTasks = computed(() => {
+    const batch = selectedBatch.value
+    if (!batch) return []
+    if (batch.batchId === batchId.value) return tasks.value
+    return batch.devices.map((device) => taskFromDevice(batch, device))
+  })
   const canRetrySelectedBatch = computed(
     () => selectedBatchId.value !== null && selectedBatchId.value === batchId.value,
   )
@@ -359,23 +406,24 @@ export const useRunStore = defineStore('run', () => {
     }
   }
 
-  function createDeviceSnapshot(
-    task: CaptureTask,
+  function createPresetSnapshot(
+    platformId: PlatformId,
+    platformName: string,
+    preset: ViewportPreset,
     captureDelayMs: CaptureDelayMs,
   ): ScreenshotDevicePresetSnapshot {
-    const platform = viewportPresets.find((item) => item.id === task.platformId)
     return {
-      selectionId: task.id,
-      platformId: task.platformId,
-      platformName: platform?.name ?? task.platformId,
-      presetId: task.preset.id,
-      presetName: task.preset.name,
-      viewport: { ...task.preset.viewport },
-      deviceScaleFactor: task.preset.deviceScaleFactor,
-      isMobile: task.preset.isMobile,
-      hasTouch: task.preset.hasTouch,
-      fullPage: task.preset.fullPage,
-      readySelector: task.preset.readySelector,
+      selectionId: getPresetSelectionId(platformId, preset.id),
+      platformId,
+      platformName,
+      presetId: preset.id,
+      presetName: preset.name,
+      viewport: { ...preset.viewport },
+      deviceScaleFactor: preset.deviceScaleFactor,
+      isMobile: preset.isMobile,
+      hasTouch: preset.hasTouch,
+      fullPage: preset.fullPage,
+      readySelector: preset.readySelector,
       captureDelayMs,
     }
   }
@@ -384,12 +432,13 @@ export const useRunStore = defineStore('run', () => {
     url: string,
     note: string,
     captureDelayMs: CaptureDelayMs,
+    devices: ScreenshotDevicePresetSnapshot[],
   ): Promise<BatchManifest> {
     const payload: CreateBatchRequest = {
       url,
       note,
       captureDelayMs,
-      devices: tasks.value.map((task) => createDeviceSnapshot(task, captureDelayMs)),
+      devices,
     }
     const response = await fetch('/api/batches', {
       method: 'POST',
@@ -425,37 +474,27 @@ export const useRunStore = defineStore('run', () => {
     }
   }
 
-  async function startBatch(
+  async function startBatchFromSnapshots(
     url: string,
     note: string,
-    selectedPresetIds: string[],
     captureDelayMs: CaptureDelayMs,
+    devices: ScreenshotDevicePresetSnapshot[],
   ): Promise<void> {
+    if (isRunning.value) throw new Error('当前已有截图批次正在运行')
+    if (devices.length === 0) throw new Error('截图批次至少需要一个设备预设')
+
     stopAllWatching()
     batchUrl.value = url
     batchId.value = ''
     batchCaptureDelayMs.value = captureDelayMs
     currentBatch.value = null
-    const selectedIds = new Set(selectedPresetIds)
-    tasks.value = viewportPresets.flatMap((platform) =>
-      platform.presets.flatMap<CaptureTask>((preset) => {
-        const taskId = getPresetSelectionId(platform.id, preset.id)
-        if (!selectedIds.has(taskId)) return []
-        return [
-          {
-            id: taskId,
-            platformId: platform.id,
-            preset,
-            status: 'queued',
-            run: null,
-            error: null,
-          },
-        ]
-      }),
+    const normalizedDevices = devices.map((device) =>
+      normalizeDeviceSnapshot(device, captureDelayMs),
     )
+    tasks.value = normalizedDevices.map(queuedTaskFromSnapshot)
 
     try {
-      const batch = await createBatch(url, note, captureDelayMs)
+      const batch = await createBatch(url, note, captureDelayMs, normalizedDevices)
       batchId.value = batch.batchId
       currentBatch.value = batch
       selectedBatchId.value = batch.batchId
@@ -464,13 +503,82 @@ export const useRunStore = defineStore('run', () => {
     } catch (error) {
       const message = error instanceof Error ? error.message : '创建批次失败'
       for (const task of tasks.value) updateTask(task.id, { status: 'failed', error: message })
-      return
+      throw error
     }
 
     await Promise.all(
       tasks.value.map((task) =>
         launchTask(task.id, url, task.preset, batchId.value, captureDelayMs),
       ),
+    )
+  }
+
+  async function startBatch(
+    url: string,
+    note: string,
+    selectedPresetIds: string[],
+    captureDelayMs: CaptureDelayMs,
+  ): Promise<void> {
+    const selectedIds = new Set(selectedPresetIds)
+    const devices = viewportPresets.flatMap((platform) =>
+      platform.presets.flatMap<ScreenshotDevicePresetSnapshot>((preset) => {
+        const selectionId = getPresetSelectionId(platform.id, preset.id)
+        if (!selectedIds.has(selectionId)) return []
+        return [createPresetSnapshot(platform.id, platform.name, preset, captureDelayMs)]
+      }),
+    )
+    await startBatchFromSnapshots(url, note, captureDelayMs, devices)
+  }
+
+  async function rerunBatch(id: string, scope: RerunScope = 'all'): Promise<void> {
+    if (isRunning.value) throw new Error('当前已有截图批次正在运行')
+    stopAllWatching()
+    const previousBatch = selectedBatch.value?.batchId === id ? selectedBatch.value : null
+    const previousDevices = new Map(
+      previousBatch?.devices.map((device) => [device.selectionId, device]) ?? [],
+    )
+    const previousTasks = new Map(
+      (batchId.value === id
+        ? tasks.value
+        : (previousBatch?.devices.map((device) => taskFromDevice(previousBatch, device)) ?? [])
+      ).map((task) => [task.id, task]),
+    )
+    const response = await fetch(`/api/batches/${id}/rerun`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope }),
+    })
+    if (!response.ok) throw new Error(await readApiError(response, '重跑截图批次失败'))
+
+    const { batch, selectionIds } = (await response.json()) as RerunBatchResponse
+    const selectedIdSet = new Set(selectionIds)
+    const mergedBatch: BatchManifest = {
+      ...batch,
+      devices: batch.devices.map((device) =>
+        selectedIdSet.has(device.selectionId)
+          ? device
+          : (previousDevices.get(device.selectionId) ?? device),
+      ),
+    }
+    batchUrl.value = batch.url
+    batchId.value = batch.batchId
+    batchCaptureDelayMs.value = batch.captureDelayMs ?? 0
+    currentBatch.value = mergedBatch
+    selectedBatchId.value = mergedBatch.batchId
+    selectedBatch.value = mergedBatch
+    tasks.value = mergedBatch.devices.map((device) =>
+      selectedIdSet.has(device.selectionId)
+        ? taskFromDevice(mergedBatch, device)
+        : (previousTasks.get(device.selectionId) ?? taskFromDevice(mergedBatch, device)),
+    )
+    upsertSummary(mergedBatch)
+
+    await Promise.all(
+      tasks.value
+        .filter((task) => selectedIdSet.has(task.id))
+        .map((task) =>
+          launchTask(task.id, batch.url, task.preset, batch.batchId, batch.captureDelayMs ?? 0),
+        ),
     )
   }
 
@@ -573,6 +681,8 @@ export const useRunStore = defineStore('run', () => {
     isRunning,
     platformProgress,
     startBatch,
+    startBatchFromSnapshots,
+    rerunBatch,
     retryTask,
     loadHistory,
     selectBatch,
@@ -581,3 +691,7 @@ export const useRunStore = defineStore('run', () => {
     setComparisonBatch,
   }
 })
+
+if (import.meta.hot) {
+  import.meta.hot.accept(acceptHMRUpdate(useRunStore, import.meta.hot))
+}
