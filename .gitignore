@@ -11,13 +11,14 @@ dist/
 # Playwright CLI sessions (console logs, page state)
 apps/server/.playwright-cli/
 
-# Agent run outputs (screenshots, snapshots, spec.ts, manifest.json)
-apps/data/agent_runs/
-
-# Legacy
+# Screenshot and Agent run archives
 data/runs/
+data/configurations/
 
 # Playwright test artifacts
 screenshots/
 test-results/
 playwright-report/
+
+# Local-only internal documentation
+local-doc/

@@ -3,8 +3,8 @@ import { fileURLToPath } from 'node:url'
 
 import type { AgentGatewayStatus } from '@viewport-lab/shared'
 
-const rootDir = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
-export const agentRunsDir = resolve(rootDir, 'data/agent_runs')
+const rootDir = resolve(fileURLToPath(new URL('../../../../', import.meta.url)))
+export const agentRunsDir = resolve(rootDir, 'data/runs')
 export const agentOutputsDir = agentRunsDir
 
 export interface AgentGatewayConfig {

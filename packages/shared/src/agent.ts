@@ -1,4 +1,4 @@
-import type { ScreenshotDevicePresetSnapshot, ScreenshotPlatformId } from './index.js'
+import type { RerunScope, ScreenshotDevicePresetSnapshot, ScreenshotPlatformId } from './index.js'
 
 export const agentRunStatuses = [
   'queued',
@@ -60,6 +60,8 @@ export interface DeviceAgentRun {
   cliDeviceName: string
   status: AgentRunStatus
   steps: DeviceAgentStep[]
+  finalScreenshotPath: string | null
+  finalScreenshotUrl: string | null
   testScriptUrl: string | null
   error: string | null
   summary: AgentStepInfo | null
@@ -67,6 +69,7 @@ export interface DeviceAgentRun {
 }
 
 export interface AgentRun {
+  kind: 'agent'
   runId: string
   createdAt: string
   updatedAt: string
@@ -75,22 +78,28 @@ export interface AgentRun {
   url: string
   task: string
   note: string
+  model: string | null
   devices: ScreenshotDevicePresetSnapshot[]
   maxTurns: number
   deviceRuns: DeviceAgentRun[]
+  rerunDeviceIds: string[]
   error: string | null
   durationMs: number | null
 }
 
 export interface AgentRunSummary {
+  kind: 'agent'
   runId: string
   createdAt: string
   completedAt: string | null
   status: AgentRunStatus
   url: string
   task: string
+  note: string
+  model: string | null
   deviceCount: number
   completedDeviceCount: number
+  failedDeviceCount: number
   stepCount: number
   durationMs: number | null
 }
@@ -105,6 +114,24 @@ export interface CreateAgentRunRequest {
 
 export interface CreateAgentRunResponse {
   run: AgentRun
+}
+
+export interface RerunAgentRunRequest {
+  scope: RerunScope
+}
+
+export interface RerunAgentRunResponse {
+  run: AgentRun
+  selectionIds: string[]
+}
+
+export interface UpdateAgentRerunListRequest {
+  deviceId: string
+  included: boolean
+}
+
+export interface UpdateAgentRerunListResponse {
+  rerunDeviceIds: string[]
 }
 
 export interface ListAgentRunsResponse {

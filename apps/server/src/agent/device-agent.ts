@@ -4,7 +4,7 @@ import type {
   DeviceAgentStep,
   ScreenshotDevicePresetSnapshot,
 } from '@viewport-lab/shared'
-import { writeFile } from 'node:fs/promises'
+import { copyFile, writeFile } from 'node:fs/promises'
 
 import type { AgentCliBridge } from './cli-bridge.js'
 import { sanitizeSessionId } from './cli-bridge.js'
@@ -34,6 +34,7 @@ export interface DeviceAgentDeps {
   screenshotsDir: string
   snapshotsDir: string
   specDir: string
+  finalScreenshotPath: string
   onDeviceStatus: (deviceId: string, status: AgentRunStatus, error: string | null) => void
   onDeviceStep: (deviceId: string, step: DeviceAgentStep) => void
 }
@@ -43,9 +44,10 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
   const deviceId = device.selectionId
   const safeDeviceId = sanitizeDeviceDir(deviceId)
   const mapping = mapToDevice(device)
-  const session = sanitizeSessionId(`agent-${runId.slice(0, 8)}-${deviceId}`)
+  const session = sanitizeSessionId(`agent-${runId.slice(-8)}-${deviceId}`)
   const steps: DeviceAgentStep[] = []
   const recordedSteps: RecordedStep[] = []
+  let lastScreenshotPath: string | null = null
 
   const deviceRun: DeviceAgentRun = {
     deviceId,
@@ -55,6 +57,8 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
     cliDeviceName: mapping.cliDeviceName,
     status: 'launching',
     steps,
+    finalScreenshotPath: null,
+    finalScreenshotUrl: null,
     testScriptUrl: null,
     error: null,
     summary: null,
@@ -67,7 +71,28 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
   try {
     deps.onDeviceStatus(deviceId, 'launching', null)
 
-    await cliBridge.open(session, url, mapping.cliDeviceName)
+    const openResult = await cliBridge.open(session, url, mapping.cliDeviceName)
+    if (!openResult.ok) {
+      const error = (openResult.error ?? openResult.output) || 'Playwright CLI 启动失败'
+      const failedStep: DeviceAgentStep = {
+        stepIndex: 0,
+        command: 'goto',
+        args: [url],
+        purpose: '打开页面',
+        status: 'failed',
+        info: null,
+        output: error,
+        snapshot: null,
+        screenshotUrl: null,
+        locator: null,
+        startedAt: new Date(startedAt).toISOString(),
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - startedAt,
+      }
+      steps.push(failedStep)
+      deps.onDeviceStep(deviceId, failedStep)
+      throw new Error(error)
+    }
     if (mapping.needsResize) {
       await cliBridge.resize(session, device.viewport.width, device.viewport.height)
     }
@@ -77,7 +102,11 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
     await writeFile(snapshotFilePath(deps.snapshotsDir, 0), initialSnapshot, 'utf8')
 
     const initialShotPath = `${deps.screenshotsDir}/00.png`
-    await cliBridge.screenshot(session, initialShotPath)
+    const initialShotResult = await cliBridge.screenshot(session, initialShotPath)
+    const initialScreenshotUrl = initialShotResult.ok
+      ? `/outputs/${runId}/agent/${safeDeviceId}/steps/00.png`
+      : null
+    if (initialShotResult.ok) lastScreenshotPath = initialShotPath
 
     const initialStep: DeviceAgentStep = {
       stepIndex: 0,
@@ -88,7 +117,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
       info: null,
       output: null,
       snapshot: initialSnapshot,
-      screenshotUrl: `/agent-outputs/${runId}/${safeDeviceId}/screenshots/00.png`,
+      screenshotUrl: initialScreenshotUrl,
       locator: null,
       startedAt: new Date(startedAt).toISOString(),
       completedAt: new Date().toISOString(),
@@ -117,7 +146,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
 
       deps.onDeviceStatus(deviceId, 'executing', null)
 
-      const stepIndex = recordedSteps.length + 1
+      const stepIndex = steps.length
       const stepStartedAt = new Date().toISOString()
       const result = await cliBridge.execute(session, command, next.args)
       const stepCompletedAt = new Date().toISOString()
@@ -126,14 +155,13 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
       }
 
       let screenshotUrl: string | null = null
-      if (command !== 'snapshot' && command !== 'find') {
-        deps.onDeviceStatus(deviceId, 'capturing', null)
-        await delay(SCREENSHOT_DELAY_MS)
-        const shotPath = `${deps.screenshotsDir}/${String(stepIndex).padStart(2, '0')}.png`
-        const shotResult = await cliBridge.screenshot(session, shotPath)
-        if (shotResult.ok) {
-          screenshotUrl = `/agent-outputs/${runId}/${safeDeviceId}/screenshots/${String(stepIndex).padStart(2, '0')}.png`
-        }
+      deps.onDeviceStatus(deviceId, 'capturing', null)
+      await delay(SCREENSHOT_DELAY_MS)
+      const shotPath = `${deps.screenshotsDir}/${String(stepIndex).padStart(2, '0')}.png`
+      const shotResult = await cliBridge.screenshot(session, shotPath)
+      if (shotResult.ok) {
+        lastScreenshotPath = shotPath
+        screenshotUrl = `/outputs/${runId}/agent/${safeDeviceId}/steps/${String(stepIndex).padStart(2, '0')}.png`
       }
 
       let locator: string | null = null
@@ -197,17 +225,43 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
     const specContent = generateSpec(device, url, task, recordedSteps)
     const specPath = `${deps.specDir}/agent.spec.ts`
     await writeFile(specPath, specContent, 'utf8')
-    deviceRun.testScriptUrl = `/agent-outputs/${runId}/${safeDeviceId}/agent.spec.ts`
+    deviceRun.testScriptUrl = `/outputs/${runId}/agent/${safeDeviceId}/agent.spec.ts`
 
-    deviceRun.status = deviceRun.summary ? 'completed' : 'completed'
+    const actionSteps = steps.slice(1)
+    const allActionsFailed =
+      actionSteps.length > 0 && actionSteps.every((step) => step.status === 'failed')
+    deviceRun.status = allActionsFailed ? 'failed' : 'completed'
+    if (allActionsFailed) {
+      deviceRun.error = '所有 Agent 操作均执行失败'
+    }
     deviceRun.durationMs = Date.now() - startedAt
-    deps.onDeviceStatus(deviceId, deviceRun.status, null)
+    deps.onDeviceStatus(deviceId, deviceRun.status, deviceRun.error)
   } catch (error) {
     deviceRun.status = 'failed'
     deviceRun.error = error instanceof Error ? error.message : String(error)
     deviceRun.durationMs = Date.now() - startedAt
     deps.onDeviceStatus(deviceId, 'failed', deviceRun.error)
   } finally {
+    try {
+      let finalScreenshotSaved = false
+      if (lastScreenshotPath) {
+        await copyFile(lastScreenshotPath, deps.finalScreenshotPath)
+        finalScreenshotSaved = true
+      } else {
+        const finalShot = await cliBridge.screenshot(session, deps.finalScreenshotPath)
+        finalScreenshotSaved = finalShot.ok
+      }
+      if (finalScreenshotSaved) {
+        deviceRun.finalScreenshotPath = `data/runs/${runId}/${safeDeviceId}.png`
+        deviceRun.finalScreenshotUrl = `/outputs/${runId}/${safeDeviceId}.png`
+      } else {
+        deviceRun.finalScreenshotPath = null
+        deviceRun.finalScreenshotUrl = null
+      }
+    } catch {
+      deviceRun.finalScreenshotPath = null
+      deviceRun.finalScreenshotUrl = null
+    }
     llm?.close()
     try {
       await cliBridge.close(session)

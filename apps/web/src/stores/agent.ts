@@ -9,7 +9,10 @@ import type {
   DeviceAgentRun,
   GetAgentRunResponse,
   ListAgentRunsResponse,
+  RerunAgentRunResponse,
+  RerunScope,
   ScreenshotDevicePresetSnapshot,
+  UpdateAgentRerunListResponse,
 } from '@viewport-lab/shared'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
@@ -18,6 +21,25 @@ import { getPresetSelectionId, viewportPresets } from '../config/viewport-preset
 import type { PlatformId, ViewportPreset } from '../types/capture'
 
 const terminalStatuses = new Set<AgentRun['status']>(['completed', 'failed', 'cancelled'])
+
+function toRunSummary(run: AgentRun): AgentRunSummary {
+  return {
+    kind: 'agent',
+    runId: run.runId,
+    createdAt: run.createdAt,
+    completedAt: run.completedAt,
+    status: run.status,
+    url: run.url,
+    task: run.task,
+    note: run.note,
+    model: run.model,
+    deviceCount: run.devices.length,
+    completedDeviceCount: run.deviceRuns.filter((device) => device.status === 'completed').length,
+    failedDeviceCount: run.deviceRuns.filter((device) => device.status === 'failed').length,
+    stepCount: run.deviceRuns.reduce((sum, device) => sum + device.steps.length, 0),
+    durationMs: run.durationMs,
+  }
+}
 
 function buildDeviceSnapshot(
   platformId: PlatformId,
@@ -47,9 +69,13 @@ export const useAgentStore = defineStore('agent', () => {
   const currentRun = ref<AgentRun | null>(null)
   const selectedRunId = ref<string | null>(null)
   const historyLoading = ref(false)
+  const detailLoading = ref(false)
   const creating = ref(false)
+  const rerunning = ref(false)
+  const rerunListUpdatingDeviceId = ref<string | null>(null)
   const error = ref<string | null>(null)
   const eventSource = ref<EventSource | null>(null)
+  let activeRerunDeviceIds: Set<string> | null = null
 
   const isRunning = computed(
     () => currentRun.value !== null && !terminalStatuses.has(currentRun.value.status),
@@ -102,7 +128,9 @@ export const useAgentStore = defineStore('agent', () => {
 
   async function selectRun(runId: string): Promise<void> {
     stopWatching()
+    activeRerunDeviceIds = null
     selectedRunId.value = runId
+    detailLoading.value = true
     try {
       const response = await fetch(`/api/agent/runs/${runId}`)
       if (!response.ok) throw new Error(await readApiError(response, '无法加载 Agent 运行详情'))
@@ -110,7 +138,44 @@ export const useAgentStore = defineStore('agent', () => {
       if (!terminalStatuses.has(currentRun.value.status)) watchRun(runId)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '无法加载 Agent 运行详情'
+    } finally {
+      detailLoading.value = false
     }
+  }
+
+  function upsertHistory(run: AgentRun): void {
+    const summary = toRunSummary(run)
+    runHistory.value = [
+      summary,
+      ...runHistory.value.filter((item) => item.runId !== summary.runId),
+    ].sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  }
+
+  function mergeRunUpdate(incomingRun: AgentRun): AgentRun {
+    const current = currentRun.value
+    if (!current || current.runId !== incomingRun.runId || activeRerunDeviceIds === null) {
+      return incomingRun
+    }
+    const incomingDevices = new Map(
+      incomingRun.deviceRuns.map((deviceRun) => [deviceRun.deviceId, deviceRun]),
+    )
+    return {
+      ...incomingRun,
+      devices: current.devices,
+      deviceRuns: current.deviceRuns.map((deviceRun) =>
+        activeRerunDeviceIds!.has(deviceRun.deviceId)
+          ? (incomingDevices.get(deviceRun.deviceId) ?? deviceRun)
+          : deviceRun,
+      ),
+    }
+  }
+
+  function applyRunUpdate(incomingRun: AgentRun): AgentRun {
+    const mergedRun = mergeRunUpdate(incomingRun)
+    currentRun.value = mergedRun
+    upsertHistory(mergedRun)
+    if (terminalStatuses.has(mergedRun.status)) activeRerunDeviceIds = null
+    return mergedRun
   }
 
   function watchRun(runId: string): void {
@@ -120,7 +185,9 @@ export const useAgentStore = defineStore('agent', () => {
 
     source.addEventListener('status', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
-      if (event.type === 'status') currentRun.value = event.run
+      if (event.type === 'status') {
+        applyRunUpdate(event.run)
+      }
     })
     source.addEventListener('device_status', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
@@ -138,18 +205,13 @@ export const useAgentStore = defineStore('agent', () => {
     source.addEventListener('device_step', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
       if (event.type === 'device_step' && currentRun.value) {
-        currentRun.value = event.run
+        applyRunUpdate(event.run)
       }
     })
     source.addEventListener('device_completed', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
       if (event.type === 'device_completed' && currentRun.value) {
-        currentRun.value = {
-          ...currentRun.value,
-          deviceRuns: currentRun.value.deviceRuns.map((dr) =>
-            dr.deviceId === event.deviceId ? event.deviceRun : dr,
-          ),
-        }
+        applyRunUpdate(event.run)
       }
     })
     source.addEventListener('log', (message) => {
@@ -168,13 +230,29 @@ export const useAgentStore = defineStore('agent', () => {
     eventSource.value = null
   }
 
+  async function submitRun(payload: CreateAgentRunRequest): Promise<AgentRun> {
+    const response = await fetch('/api/agent/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(await readApiError(response, '创建 Agent 运行失败'))
+    const run = ((await response.json()) as CreateAgentRunResponse).run
+    activeRerunDeviceIds = null
+    currentRun.value = run
+    selectedRunId.value = run.runId
+    upsertHistory(run)
+    if (!terminalStatuses.has(run.status)) watchRun(run.runId)
+    return run
+  }
+
   async function createRun(params: {
     url: string
     task: string
     note: string
     selectedPresetIds: string[]
     maxTurns: number
-  }): Promise<void> {
+  }): Promise<AgentRun | null> {
     creating.value = true
     error.value = null
     try {
@@ -196,21 +274,87 @@ export const useAgentStore = defineStore('agent', () => {
         devices,
         maxTurns: params.maxTurns,
       }
-      const response = await fetch('/api/agent/runs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      if (!response.ok) throw new Error(await readApiError(response, '创建 Agent 运行失败'))
-      const run = ((await response.json()) as CreateAgentRunResponse).run
-      currentRun.value = run
-      selectedRunId.value = run.runId
-      await loadHistory()
-      if (!terminalStatuses.has(run.status)) watchRun(run.runId)
+      return await submitRun(payload)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '创建 Agent 运行失败'
+      return null
     } finally {
       creating.value = false
+    }
+  }
+
+  async function createRunFromSnapshots(payload: CreateAgentRunRequest): Promise<AgentRun | null> {
+    creating.value = true
+    error.value = null
+    try {
+      if (payload.devices.length === 0) throw new Error('至少选择一个设备视口')
+      return await submitRun({
+        ...payload,
+        url: payload.url.trim(),
+        task: payload.task.trim(),
+        note: payload.note.trim(),
+        devices: payload.devices.map((device) => ({
+          ...device,
+          viewport: { ...device.viewport },
+        })),
+      })
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '创建 Agent 运行失败'
+      return null
+    } finally {
+      creating.value = false
+    }
+  }
+
+  async function rerunRun(runId: string, scope: RerunScope = 'all'): Promise<AgentRun | null> {
+    rerunning.value = true
+    error.value = null
+    try {
+      const response = await fetch(`/api/agent/runs/${runId}/rerun`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      })
+      if (!response.ok) throw new Error(await readApiError(response, '重跑 Agent 批次失败'))
+      const result = (await response.json()) as RerunAgentRunResponse
+      activeRerunDeviceIds = new Set(result.selectionIds)
+      const run = applyRunUpdate(result.run)
+      selectedRunId.value = run.runId
+      watchRun(run.runId)
+      return run
+    } catch (err) {
+      activeRerunDeviceIds = null
+      error.value = err instanceof Error ? err.message : '重跑 Agent 批次失败'
+      return null
+    } finally {
+      rerunning.value = false
+    }
+  }
+
+  async function updateRerunList(deviceId: string, included: boolean): Promise<void> {
+    const run = currentRun.value
+    if (!run) throw new Error('请先选择 Agent 批次')
+    rerunListUpdatingDeviceId.value = deviceId
+    error.value = null
+    try {
+      const response = await fetch(`/api/agent/runs/${run.runId}/rerun-list`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId, included }),
+      })
+      if (!response.ok) throw new Error(await readApiError(response, '更新重跑清单失败'))
+      const result = (await response.json()) as UpdateAgentRerunListResponse
+      if (currentRun.value?.runId === run.runId) {
+        currentRun.value = {
+          ...currentRun.value,
+          rerunDeviceIds: result.rerunDeviceIds,
+        }
+      }
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : '更新重跑清单失败'
+      throw err
+    } finally {
+      rerunListUpdatingDeviceId.value = null
     }
   }
 
@@ -220,6 +364,7 @@ export const useAgentStore = defineStore('agent', () => {
     runHistory.value = runHistory.value.filter((item) => item.runId !== runId)
     if (selectedRunId.value === runId) {
       stopWatching()
+      activeRerunDeviceIds = null
       selectedRunId.value = null
       currentRun.value = null
     }
@@ -231,7 +376,10 @@ export const useAgentStore = defineStore('agent', () => {
     currentRun,
     selectedRunId,
     historyLoading,
+    detailLoading,
     creating,
+    rerunning,
+    rerunListUpdatingDeviceId,
     error,
     isRunning,
     deviceRuns,
@@ -240,6 +388,9 @@ export const useAgentStore = defineStore('agent', () => {
     loadHistory,
     selectRun,
     createRun,
+    createRunFromSnapshots,
+    rerunRun,
+    updateRerunList,
     deleteRun,
     stopWatching,
   }

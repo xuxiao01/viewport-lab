@@ -1,14 +1,18 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
-import AgentView from './views/AgentView.vue'
-import BatchView from './views/BatchView.vue'
+import ConfigurationListView from './views/ConfigurationListView.vue'
 import HomeView from './views/HomeView.vue'
 
 export default createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'home', component: HomeView },
-    { path: '/agent', name: 'agent', component: AgentView },
-    { path: '/batch', name: 'batch', component: BatchView },
+    {
+      path: '/configurations',
+      name: 'configurations',
+      component: ConfigurationListView,
+    },
+    { path: '/agent', redirect: '/' },
+    { path: '/batch', redirect: '/' },
   ],
 })

@@ -11,9 +11,8 @@ import type {
   RetryRunSummary,
 } from '@viewport-lab/shared'
 
+import { archiveIdPattern } from '../run-archive.js'
 import { agentRunsDir } from './config.js'
-
-const runIdPattern = /^[0-9a-f-]{36}$/i
 
 export function sanitizeDeviceDir(deviceId: string): string {
   return deviceId.replace(/:/g, '-')
@@ -28,7 +27,7 @@ function runManifestPath(runId: string): string {
 }
 
 export async function ensureRunDirs(runId: string): Promise<AgentRunPersisted> {
-  if (!runIdPattern.test(runId)) throw new Error(`Invalid agent run id: ${runId}`)
+  if (!archiveIdPattern.test(runId)) throw new Error(`Invalid agent run id: ${runId}`)
   const runDir = resolve(agentRunsDir, runId)
   const eventsPath = resolve(runDir, 'events.jsonl')
   await mkdir(runDir, { recursive: true })
@@ -38,13 +37,23 @@ export async function ensureRunDirs(runId: string): Promise<AgentRunPersisted> {
 export async function ensureDeviceDirs(runId: string, deviceId: string): Promise<DeviceRunDirs> {
   const runDir = resolve(agentRunsDir, runId)
   const safeId = sanitizeDeviceDir(deviceId)
-  const deviceDir = resolve(runDir, safeId)
-  const screenshotsDir = resolve(deviceDir, 'screenshots')
+  const deviceDir = resolve(runDir, 'agent', safeId)
+  const screenshotsDir = resolve(deviceDir, 'steps')
   const snapshotsDir = resolve(deviceDir, 'snapshots')
   const specDir = deviceDir
+  const finalScreenshotPath = resolve(runDir, `${safeId}.png`)
   await mkdir(screenshotsDir, { recursive: true })
   await mkdir(snapshotsDir, { recursive: true })
-  return { deviceDir, screenshotsDir, snapshotsDir, specDir }
+  return { deviceDir, screenshotsDir, snapshotsDir, specDir, finalScreenshotPath }
+}
+
+export async function clearDeviceArtifacts(runId: string, deviceId: string): Promise<void> {
+  if (!archiveIdPattern.test(runId)) throw new Error(`Invalid agent run id: ${runId}`)
+  const safeId = sanitizeDeviceDir(deviceId)
+  await Promise.all([
+    rm(resolve(agentRunsDir, runId, 'agent', safeId), { recursive: true, force: true }),
+    rm(resolve(agentRunsDir, runId, `${safeId}.png`), { force: true }),
+  ])
 }
 
 export interface AgentRunPersisted {
@@ -57,6 +66,7 @@ export interface DeviceRunDirs {
   screenshotsDir: string
   snapshotsDir: string
   specDir: string
+  finalScreenshotPath: string
 }
 
 export class AgentRunRecorder {
@@ -129,13 +139,37 @@ export class AgentRunRecorder {
   }
 }
 
+export async function updateAgentRerunList(
+  run: AgentRun,
+  deviceId: string,
+  included: boolean,
+): Promise<string[]> {
+  const ids = new Set(run.rerunDeviceIds)
+  if (included) ids.add(deviceId)
+  else ids.delete(deviceId)
+  const rerunDeviceIds = run.devices
+    .map((device) => device.selectionId)
+    .filter((selectionId) => ids.has(selectionId))
+  const recorder = new AgentRunRecorder(await ensureRunDirs(run.runId), run)
+  recorder.update({ rerunDeviceIds })
+  await recorder.persist()
+  return rerunDeviceIds
+}
+
 export async function readAgentRun(runId: string): Promise<AgentRun | null> {
-  if (!runIdPattern.test(runId)) return null
+  if (!archiveIdPattern.test(runId)) return null
   try {
     const contents = await readFile(runManifestPath(runId), 'utf8')
     const run = JSON.parse(contents) as AgentRun
-    if (run.runId !== runId) return null
+    if (run.kind !== 'agent' || run.runId !== runId) return null
     if (!run.deviceRuns) return null
+    const validDeviceIds = new Set(run.deviceRuns.map((deviceRun) => deviceRun.deviceId))
+    run.rerunDeviceIds = Array.isArray(run.rerunDeviceIds)
+      ? run.rerunDeviceIds.filter(
+          (deviceId): deviceId is string =>
+            typeof deviceId === 'string' && validDeviceIds.has(deviceId),
+        )
+      : []
     return run
   } catch {
     return null
@@ -151,7 +185,7 @@ export async function listAgentRuns(): Promise<AgentRun[]> {
   }
   const runs = await Promise.all(
     entries
-      .filter((entry) => entry.isDirectory() && runIdPattern.test(entry.name))
+      .filter((entry) => entry.isDirectory() && archiveIdPattern.test(entry.name))
       .map((entry) => readAgentRun(entry.name)),
   )
   return runs
@@ -162,7 +196,7 @@ export async function listAgentRuns(): Promise<AgentRun[]> {
 const retryIdPattern = /^[0-9a-f-]{36}$/i
 
 function retriesDir(runId: string): string {
-  return resolve(agentRunsDir, runId, 'retries')
+  return resolve(agentRunsDir, runId, 'agent', 'retries')
 }
 
 function retryManifestPath(runId: string, retryId: string): string {
@@ -170,7 +204,7 @@ function retryManifestPath(runId: string, retryId: string): string {
 }
 
 export async function writeRetryRun(retry: RetryRun): Promise<void> {
-  if (!runIdPattern.test(retry.runId)) return
+  if (!archiveIdPattern.test(retry.runId)) return
   const dir = resolve(retriesDir(retry.runId), retry.retryId)
   await mkdir(dir, { recursive: true })
   await writeFile(
@@ -181,7 +215,7 @@ export async function writeRetryRun(retry: RetryRun): Promise<void> {
 }
 
 export async function readRetryRun(runId: string, retryId: string): Promise<RetryRun | null> {
-  if (!runIdPattern.test(runId) || !retryIdPattern.test(retryId)) return null
+  if (!archiveIdPattern.test(runId) || !retryIdPattern.test(retryId)) return null
   try {
     const contents = await readFile(retryManifestPath(runId, retryId), 'utf8')
     return JSON.parse(contents) as RetryRun
@@ -208,7 +242,7 @@ export function toRetrySummary(retry: RetryRun): RetryRunSummary {
 }
 
 export async function listRetryRuns(runId: string): Promise<RetryRunSummary[]> {
-  if (!runIdPattern.test(runId)) return []
+  if (!archiveIdPattern.test(runId)) return []
   let entries: Dirent[]
   try {
     entries = await readdir(retriesDir(runId), { withFileTypes: true })

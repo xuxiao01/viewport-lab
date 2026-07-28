@@ -14,6 +14,12 @@ export const batchStatuses = ['queued', 'running', 'completed', 'partial_failed'
 
 export type BatchStatus = (typeof batchStatuses)[number]
 
+export const runKinds = ['viewport', 'agent'] as const
+
+export type RunKind = (typeof runKinds)[number]
+
+export type RerunScope = 'all' | 'failed' | 'list'
+
 export const screenshotPlatformIds = [
   'ios-phone',
   'ios-tablet',
@@ -87,6 +93,7 @@ export interface CreateBatchRequest {
 }
 
 export interface BatchManifest {
+  kind: 'viewport'
   batchId: string
   createdAt: string
   updatedAt: string
@@ -103,6 +110,7 @@ export interface BatchManifest {
 }
 
 export interface BatchSummary {
+  kind: 'viewport'
   batchId: string
   createdAt: string
   completedAt: string | null
@@ -118,6 +126,15 @@ export interface BatchSummary {
 
 export interface CreateBatchResponse {
   batch: BatchManifest
+}
+
+export interface RerunBatchRequest {
+  scope: RerunScope
+}
+
+export interface RerunBatchResponse {
+  batch: BatchManifest
+  selectionIds: string[]
 }
 
 export interface ListBatchesResponse {
@@ -160,3 +177,4 @@ export interface RunEvent {
 }
 
 export * from './agent.js'
+export * from './test-configuration.js'

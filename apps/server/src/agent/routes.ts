@@ -14,9 +14,13 @@ import type {
   GetRetryRunResponse,
   ListAgentRunsResponse,
   ListRetryRunsResponse,
+  RerunAgentRunRequest,
+  RerunAgentRunResponse,
   RetryDeviceResult,
   RetryRun,
   RetryScreenshot,
+  UpdateAgentRerunListRequest,
+  UpdateAgentRerunListResponse,
 } from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import type { FastifyInstance } from 'fastify'
@@ -30,9 +34,10 @@ import {
   readAgentRun,
   readRetryRun,
   sanitizeDeviceDir,
+  updateAgentRerunList,
   writeRetryRun,
 } from './recorder.js'
-import { startAgentRun } from './runner.js'
+import { rerunAgentRunInPlace, startAgentRun } from './runner.js'
 import type { AgentEventSink } from './runner.js'
 
 type Subscriber = (event: AgentEvent) => void
@@ -57,16 +62,21 @@ function isHttpUrl(value: string): boolean {
 
 function toRunSummary(run: AgentRun): AgentRunSummary {
   const completedDeviceCount = run.deviceRuns.filter((dr) => dr.status === 'completed').length
+  const failedDeviceCount = run.deviceRuns.filter((dr) => dr.status === 'failed').length
   const stepCount = run.deviceRuns.reduce((sum, dr) => sum + dr.steps.length, 0)
   return {
+    kind: 'agent',
     runId: run.runId,
     createdAt: run.createdAt,
     completedAt: run.completedAt,
     status: run.status,
     url: run.url,
     task: run.task,
+    note: run.note,
+    model: run.model,
     deviceCount: run.devices.length,
     completedDeviceCount,
+    failedDeviceCount,
     stepCount,
     durationMs: run.durationMs,
   }
@@ -111,8 +121,8 @@ function isRunTerminal(run: AgentRun): boolean {
 async function retryRunSpecs(runId: string): Promise<RetryRun> {
   const retryId = randomUUID()
   const startedAt = new Date().toISOString()
-  const runDir = resolve(agentRunsDir, runId)
-  const projectRoot = resolve(agentRunsDir, '..', '..', '..', '..')
+  const runDir = resolve(agentRunsDir, runId, 'agent')
+  const projectRoot = resolve(agentRunsDir, '..', '..')
   const configPath = resolve(projectRoot, 'playwright.config.ts')
   const deviceResults: RetryDeviceResult[] = []
 
@@ -217,7 +227,7 @@ async function retryRunSpecs(runId: string): Promise<RetryRun> {
       const stepIndex = parseInt(fname.replace('.png', ''), 10) || 0
       return {
         stepIndex,
-        url: `/agent-outputs/${runId}/retries/${retryId}/${safeDeviceId}/screenshots/${fname}`,
+        url: `/outputs/${runId}/agent/retries/${retryId}/${safeDeviceId}/screenshots/${fname}`,
       }
     })
 
@@ -284,6 +294,56 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(201).send({ run })
     },
   )
+
+  app.put<{
+    Params: { runId: string }
+    Body: unknown
+    Reply: UpdateAgentRerunListResponse | { error: string }
+  }>('/api/agent/runs/:runId/rerun-list', async (request, reply) => {
+    const body = request.body as Partial<UpdateAgentRerunListRequest> | null
+    if (
+      typeof body?.deviceId !== 'string' ||
+      body.deviceId.length === 0 ||
+      typeof body.included !== 'boolean'
+    ) {
+      return reply.code(400).send({ error: 'Invalid rerun list request' })
+    }
+    const run = await readAgentRun(request.params.runId)
+    if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+    if (!isRunTerminal(run)) {
+      return reply.code(409).send({ error: '运行中的 Agent 批次不能修改重跑清单' })
+    }
+    if (!run.deviceRuns.some((deviceRun) => deviceRun.deviceId === body.deviceId)) {
+      return reply.code(404).send({ error: 'Agent 设备不存在' })
+    }
+    const rerunDeviceIds = await updateAgentRerunList(run, body.deviceId, body.included)
+    return reply.send({ rerunDeviceIds })
+  })
+
+  app.post<{
+    Params: { runId: string }
+    Body: unknown
+    Reply: RerunAgentRunResponse | { error: string }
+  }>('/api/agent/runs/:runId/rerun', async (request, reply) => {
+    const body = request.body as Partial<RerunAgentRunRequest> | null
+    const scope = body?.scope
+    if (scope !== 'all' && scope !== 'failed' && scope !== 'list') {
+      return reply.code(400).send({ error: 'Invalid rerun scope' })
+    }
+    const sourceRun = await readAgentRun(request.params.runId)
+    if (!sourceRun) return reply.code(404).send({ error: 'Agent run not found' })
+    if (!isRunTerminal(sourceRun)) {
+      return reply.code(409).send({ error: '运行中的 Agent 批次不能重跑' })
+    }
+    try {
+      const result = await rerunAgentRunInPlace({ sourceRun, scope, emit })
+      return reply.send(result)
+    } catch (error) {
+      return reply
+        .code(409)
+        .send({ error: error instanceof Error ? error.message : '重跑 Agent 批次失败' })
+    }
+  })
 
   app.delete<{ Params: { runId: string } }>('/api/agent/runs/:runId', async (request, reply) => {
     const { runId } = request.params

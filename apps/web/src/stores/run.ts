@@ -9,6 +9,8 @@ import type {
   CreateRunRequest,
   CreateRunResponse,
   ListBatchesResponse,
+  RerunBatchResponse,
+  RerunScope,
   RunEvent,
   RunManifest,
   RunStatus,
@@ -46,6 +48,7 @@ function toBatchSummary(batch: BatchManifest): BatchSummary {
     failedCount,
   } = batch
   return {
+    kind: 'viewport',
     batchId,
     createdAt,
     completedAt,
@@ -204,11 +207,12 @@ export const useRunStore = defineStore('run', () => {
     totalCount.value === 0 ? 0 : Math.round((completedCount.value / totalCount.value) * 100),
   )
   const isRunning = computed(() => tasks.value.some((task) => !terminalStatuses.has(task.status)))
-  const selectedTasks = computed(() =>
-    selectedBatch.value
-      ? selectedBatch.value.devices.map((device) => taskFromDevice(selectedBatch.value!, device))
-      : [],
-  )
+  const selectedTasks = computed(() => {
+    const batch = selectedBatch.value
+    if (!batch) return []
+    if (batch.batchId === batchId.value) return tasks.value
+    return batch.devices.map((device) => taskFromDevice(batch, device))
+  })
   const canRetrySelectedBatch = computed(
     () => selectedBatchId.value !== null && selectedBatchId.value === batchId.value,
   )
@@ -526,17 +530,56 @@ export const useRunStore = defineStore('run', () => {
     await startBatchFromSnapshots(url, note, captureDelayMs, devices)
   }
 
-  async function rerunBatch(id: string): Promise<void> {
+  async function rerunBatch(id: string, scope: RerunScope = 'all'): Promise<void> {
     if (isRunning.value) throw new Error('当前已有截图批次正在运行')
-    const sourceBatch = await fetchBatchDetail(id)
-    if (!terminalBatchStatuses.has(sourceBatch.status)) {
-      throw new Error('只能重跑已结束的截图批次')
-    }
-    const captureDelayMs = sourceBatch.captureDelayMs ?? 0
-    const devices = sourceBatch.devices.map((device) =>
-      normalizeDeviceSnapshot(device, captureDelayMs),
+    stopAllWatching()
+    const previousBatch = selectedBatch.value?.batchId === id ? selectedBatch.value : null
+    const previousDevices = new Map(
+      previousBatch?.devices.map((device) => [device.selectionId, device]) ?? [],
     )
-    await startBatchFromSnapshots(sourceBatch.url, sourceBatch.note, captureDelayMs, devices)
+    const previousTasks = new Map(
+      (batchId.value === id
+        ? tasks.value
+        : (previousBatch?.devices.map((device) => taskFromDevice(previousBatch, device)) ?? [])
+      ).map((task) => [task.id, task]),
+    )
+    const response = await fetch(`/api/batches/${id}/rerun`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope }),
+    })
+    if (!response.ok) throw new Error(await readApiError(response, '重跑截图批次失败'))
+
+    const { batch, selectionIds } = (await response.json()) as RerunBatchResponse
+    const selectedIdSet = new Set(selectionIds)
+    const mergedBatch: BatchManifest = {
+      ...batch,
+      devices: batch.devices.map((device) =>
+        selectedIdSet.has(device.selectionId)
+          ? device
+          : (previousDevices.get(device.selectionId) ?? device),
+      ),
+    }
+    batchUrl.value = batch.url
+    batchId.value = batch.batchId
+    batchCaptureDelayMs.value = batch.captureDelayMs ?? 0
+    currentBatch.value = mergedBatch
+    selectedBatchId.value = mergedBatch.batchId
+    selectedBatch.value = mergedBatch
+    tasks.value = mergedBatch.devices.map((device) =>
+      selectedIdSet.has(device.selectionId)
+        ? taskFromDevice(mergedBatch, device)
+        : (previousTasks.get(device.selectionId) ?? taskFromDevice(mergedBatch, device)),
+    )
+    upsertSummary(mergedBatch)
+
+    await Promise.all(
+      tasks.value
+        .filter((task) => selectedIdSet.has(task.id))
+        .map((task) =>
+          launchTask(task.id, batch.url, task.preset, batch.batchId, batch.captureDelayMs ?? 0),
+        ),
+    )
   }
 
   async function retryTask(taskId: string): Promise<void> {
@@ -638,6 +681,7 @@ export const useRunStore = defineStore('run', () => {
     isRunning,
     platformProgress,
     startBatch,
+    startBatchFromSnapshots,
     rerunBatch,
     retryTask,
     loadHistory,

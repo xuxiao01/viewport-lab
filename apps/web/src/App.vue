@@ -6,15 +6,16 @@ const route = useRoute()
 
 <template>
   <div class="app-shell">
-    <nav class="app-tabs">
+    <nav class="app-tabs" aria-label="主要功能">
       <router-link to="/" class="app-tab" :class="{ active: route.name === 'home' }">
-        视口截图
+        创建检测任务
       </router-link>
-      <router-link to="/agent" class="app-tab" :class="{ active: route.name === 'agent' }">
-        Agent 探索
-      </router-link>
-      <router-link to="/batch" class="app-tab" :class="{ active: route.name === 'batch' }">
-        批次重放
+      <router-link
+        to="/configurations"
+        class="app-tab"
+        :class="{ active: route.name === 'configurations' }"
+      >
+        配置清单
       </router-link>
     </nav>
     <router-view />
@@ -28,7 +29,7 @@ const route = useRoute()
 
 .app-tabs {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   justify-content: center;
   padding: 10px 16px 0;
   border-bottom: 1px solid var(--color-border-light);
@@ -40,7 +41,7 @@ const route = useRoute()
   border-bottom: 2px solid transparent;
   color: var(--color-text-muted);
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 650;
   text-decoration: none;
   transition:
     color 0.15s ease,

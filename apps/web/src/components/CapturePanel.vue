@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { batchNoteMaxLength } from '@viewport-lab/shared'
-import type { CaptureDelayMs } from '@viewport-lab/shared'
+import type { AgentGatewayStatus, CaptureDelayMs } from '@viewport-lab/shared'
 import { computed } from 'vue'
 
 import DevicePresetPanel from './DevicePresetPanel.vue'
@@ -11,7 +11,10 @@ import type { PlatformId, PlatformPresetGroup } from '../types/capture'
 const props = defineProps<{
   url: string
   note: string
+  aiTaskDescription: string
+  maxTurns: number
   captureDelayMs: CaptureDelayMs
+  gatewayStatus: AgentGatewayStatus | null
   selectedCategories: PlatformId[]
   activeCategory: PlatformId | null
   selectedPresetIds: string[]
@@ -22,6 +25,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:url': [value: string]
   'update:note': [value: string]
+  'update:aiTaskDescription': [value: string]
+  'update:maxTurns': [value: number]
   'update:captureDelayMs': [value: CaptureDelayMs]
   'update:activeCategory': [value: PlatformId]
   'update:selectedPresetIds': [value: string[]]
@@ -39,6 +44,8 @@ const selectedPresetCount = computed(() =>
   }, 0),
 )
 
+const isAgentMode = computed(() => props.aiTaskDescription.trim().length > 0)
+
 const isValidUrl = computed(() => {
   try {
     const url = new URL(props.url)
@@ -48,7 +55,14 @@ const isValidUrl = computed(() => {
   }
 })
 
-const canStart = computed(() => isValidUrl.value && selectedPresetCount.value > 0 && !props.running)
+const gatewayReady = computed(() => props.gatewayStatus?.configured ?? false)
+const canStart = computed(
+  () =>
+    isValidUrl.value &&
+    selectedPresetCount.value > 0 &&
+    !props.running &&
+    (!isAgentMode.value || gatewayReady.value),
+)
 
 const captureModes: Array<{
   value: CaptureDelayMs
@@ -72,42 +86,29 @@ const captureModes: Array<{
   <section class="capture-panel surface-card">
     <div class="section-heading">
       <div>
-        <h2>创建截图任务</h2>
-        <p>输入目标页面并选择需要检查的平台</p>
+        <h2>创建检测任务</h2>
+        <p>填写 AI 任务描述即可探索页面，留空则直接批量截图</p>
       </div>
-      <span>{{ selectedPresetCount }} 个截图任务</span>
     </div>
 
-    <label class="url-label" for="target-url">目标页面完整 URL</label>
-    <div class="url-row">
-      <el-input
-        id="target-url"
-        :model-value="url"
-        size="large"
-        placeholder="https://example.com/page"
-        clearable
-        :disabled="running"
-        @update:model-value="emit('update:url', $event)"
-        @keyup.enter="canStart && emit('start')"
-      />
-      <el-button
-        class="capture-button"
-        type="primary"
-        size="large"
-        :disabled="!canStart"
-        :loading="running"
-        @click="emit('start')"
-      >
-        {{ running ? '批量截图中' : '开始批量截图' }}
-      </el-button>
-    </div>
+    <label class="field-label" for="target-url">目标页面 URL</label>
+    <el-input
+      id="target-url"
+      :model-value="url"
+      size="large"
+      placeholder="请输入需要检测的完整页面地址，例如 http://localhost:5188"
+      clearable
+      :disabled="running"
+      @update:model-value="emit('update:url', $event)"
+      @keyup.enter="canStart && emit('start')"
+    />
     <p v-if="url && !isValidUrl" class="field-error">请输入有效的 HTTP 或 HTTPS URL</p>
 
-    <label class="note-label" for="batch-note">本次备注（可选）</label>
+    <label class="field-label spaced-label" for="batch-note">任务标题 / 备注（可选）</label>
     <el-input
       id="batch-note"
       :model-value="note"
-      placeholder="例如：调整头部高度、修复 360px 横向溢出"
+      placeholder="例如：首页移动端适配检查"
       clearable
       show-word-limit
       :maxlength="batchNoteMaxLength"
@@ -115,27 +116,75 @@ const captureModes: Array<{
       @update:model-value="emit('update:note', $event)"
     />
 
-    <div class="mode-heading">
-      <strong>截图模式</strong>
-      <span>30 秒模式适合需要等待异步数据或动画稳定的页面</span>
-    </div>
-    <div class="capture-modes">
-      <button
-        v-for="mode in captureModes"
-        :key="mode.value"
-        type="button"
-        class="capture-mode"
-        :class="{ active: captureDelayMs === mode.value }"
-        :disabled="running"
-        @click="emit('update:captureDelayMs', mode.value)"
-      >
-        <span class="mode-indicator" aria-hidden="true"></span>
-        <span class="mode-copy">
-          <strong>{{ mode.title }}</strong>
-          <small>{{ mode.description }}</small>
-        </span>
-      </button>
-    </div>
+    <label class="field-label spaced-label" for="ai-task-description"> AI 任务描述（可选） </label>
+    <el-input
+      id="ai-task-description"
+      :model-value="aiTaskDescription"
+      type="textarea"
+      :rows="4"
+      placeholder="例如：依次检查首页、课程详情页和支付页，重点关注按钮遮挡、文字溢出和横向滚动，并在关键步骤截图。"
+      :disabled="running"
+      @update:model-value="emit('update:aiTaskDescription', $event)"
+    />
+    <p class="ai-helper">
+      留空时，将直接按下方选定的设备视口进行页面截图；填写后，Agent
+      将根据任务描述操作和探索页面，并在关键步骤截图。
+    </p>
+    <p
+      v-if="isAgentMode"
+      class="gateway-status"
+      :class="{ ready: gatewayReady, unavailable: gatewayStatus && !gatewayReady }"
+    >
+      <template v-if="!gatewayStatus">正在检查 AI 网关配置…</template>
+      <template v-else-if="gatewayReady">
+        AI 网关已连接 · 模型 {{ gatewayStatus.model ?? '未指定' }}
+      </template>
+      <template v-else>
+        AI 网关不可用{{ gatewayStatus.reason ? ` · ${gatewayStatus.reason}` : '' }}
+      </template>
+    </p>
+
+    <template v-if="isAgentMode">
+      <div class="mode-heading">
+        <strong>Agent 设置</strong>
+        <span>限制 Agent 在每台设备上最多执行的操作轮数</span>
+      </div>
+      <div class="agent-settings">
+        <label for="agent-max-turns">最大轮数</label>
+        <el-input-number
+          id="agent-max-turns"
+          :model-value="maxTurns"
+          :min="1"
+          :max="100"
+          :disabled="running"
+          @update:model-value="typeof $event === 'number' && emit('update:maxTurns', $event)"
+        />
+        <span>范围 1–100，默认 50</span>
+      </div>
+    </template>
+    <template v-else>
+      <div class="mode-heading">
+        <strong>截图模式</strong>
+        <span>30 秒模式适合需要等待异步数据或动画稳定的页面</span>
+      </div>
+      <div class="capture-modes">
+        <button
+          v-for="mode in captureModes"
+          :key="mode.value"
+          type="button"
+          class="capture-mode"
+          :class="{ active: captureDelayMs === mode.value }"
+          :disabled="running"
+          @click="emit('update:captureDelayMs', mode.value)"
+        >
+          <span class="mode-indicator" aria-hidden="true"></span>
+          <span class="mode-copy">
+            <strong>{{ mode.title }}</strong>
+            <small>{{ mode.description }}</small>
+          </span>
+        </button>
+      </div>
+    </template>
 
     <div class="platform-heading">
       <strong>选择平台</strong>
@@ -157,6 +206,28 @@ const captureModes: Array<{
       @update:active-category="emit('update:activeCategory', $event)"
       @update:selected-preset-ids="emit('update:selectedPresetIds', $event)"
     />
+
+    <div class="form-actions">
+      <span>{{ selectedPresetCount }} 个{{ isAgentMode ? '设备任务' : '截图任务' }}</span>
+      <el-button
+        class="capture-button"
+        type="primary"
+        size="large"
+        :disabled="!canStart"
+        :loading="running"
+        @click="emit('start')"
+      >
+        {{
+          running
+            ? isAgentMode
+              ? 'AI 探索中'
+              : '批量截图中'
+            : isAgentMode
+              ? '开始 AI 探索'
+              : '开始批量截图'
+        }}
+      </el-button>
+    </div>
   </section>
 </template>
 
@@ -195,6 +266,28 @@ const captureModes: Array<{
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.agent-settings {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 54px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-subtle);
+}
+
+.agent-settings label {
+  color: var(--color-text-strong);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.agent-settings span {
+  color: var(--color-text-muted);
+  font-size: 12px;
 }
 
 .capture-mode {
@@ -276,18 +369,7 @@ const captureModes: Array<{
   font-size: 12px;
 }
 
-.section-heading > span {
-  flex: 0 0 auto;
-  padding: 5px 9px;
-  border-radius: 999px;
-  color: var(--color-primary-dark);
-  background: var(--color-primary-soft);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.url-label,
-.note-label {
+.field-label {
   display: block;
   margin-bottom: 8px;
   color: var(--color-text-secondary);
@@ -295,18 +377,48 @@ const captureModes: Array<{
   font-weight: 650;
 }
 
-.note-label {
+.spaced-label {
   margin-top: 15px;
 }
 
-.url-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
+.ai-helper {
+  margin: 8px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.gateway-status {
+  margin: 8px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.gateway-status.ready {
+  color: var(--color-success);
+}
+
+.gateway-status.unavailable {
+  color: var(--color-danger);
 }
 
 .capture-button {
   min-width: 148px;
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border-light);
+}
+
+.form-actions > span {
+  color: var(--color-text-muted);
+  font-size: 12px;
 }
 
 .field-error {
@@ -343,10 +455,6 @@ const captureModes: Array<{
     padding: 18px;
   }
 
-  .url-row {
-    grid-template-columns: 1fr;
-  }
-
   .capture-button {
     width: 100%;
   }
@@ -361,6 +469,24 @@ const captureModes: Array<{
 
   .platform-heading span {
     display: none;
+  }
+
+  .agent-settings {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .agent-settings span {
+    flex-basis: 100%;
+  }
+
+  .form-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .form-actions > span {
+    text-align: right;
   }
 }
 </style>

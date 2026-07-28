@@ -1,5 +1,6 @@
 import type { AgentStepInfo, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 import http from 'node:http'
+import { Readable } from 'node:stream'
 import OpenAI from 'openai'
 import type {
   ChatCompletion,
@@ -7,72 +8,36 @@ import type {
 } from 'openai/resources/chat/completions.js'
 
 import type { AgentGatewayConfig } from './config.js'
-import {
-  buildContinuePrompt,
-  buildTaskPrompt,
-  SYSTEM_PROMPT,
-  TOOL_DEFINITIONS,
-} from './prompts.js'
+import { buildContinuePrompt, buildTaskPrompt, SYSTEM_PROMPT, TOOL_DEFINITIONS } from './prompts.js'
 
 function createGatewayFetch(vhost: string): typeof fetch {
-  return async (input, init) => {
-    const url = new URL(typeof input === 'string' ? input : input.toString())
-    const body = init?.body
-    const bodyStr =
-      typeof body === 'string' ? body : body && typeof body === 'object' ? JSON.stringify(body) : ''
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      Host: vhost,
-      'Content-Length': String(Buffer.byteLength(bodyStr)),
-    }
-    if (init?.headers) {
-      const initHeaders = init.headers
-      if (initHeaders instanceof Headers) {
-        initHeaders.forEach((value, key) => {
-          if (key.toLowerCase() !== 'host') headers[key] = value
-        })
-      } else if (Array.isArray(initHeaders)) {
-        for (const [key, value] of initHeaders) {
-          if (key.toLowerCase() !== 'host') headers[key] = value
-        }
-      } else if (typeof initHeaders === 'object') {
-        for (const [key, value] of Object.entries(initHeaders)) {
-          if (key.toLowerCase() !== 'host') headers[key] = String(value)
-        }
-      }
-    }
-
-    return new Promise((resolve, reject) => {
-      const req = http.request(
+  return (input, init = {}) =>
+    new Promise((resolve, reject) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url)
+      const headers = new Headers(init.headers)
+      headers.set('Host', vhost)
+      const outgoingHeaders: Record<string, string> = {}
+      headers.forEach((value, name) => {
+        outgoingHeaders[name] = value
+      })
+      const request = http.request(
+        url,
         {
-          method: init?.method ?? 'POST',
-          hostname: url.hostname,
-          port: url.port || 80,
-          path: url.pathname + url.search,
-          headers,
+          method: init.method,
+          headers: outgoingHeaders,
+          signal: init.signal ?? undefined,
         },
-        (res) => {
-          let data = ''
-          res.setEncoding('utf8')
-          res.on('data', (chunk: string) => {
-            data += chunk
-          })
-          res.on('end', () => {
-            resolve(
-              new Response(data, {
-                status: res.statusCode ?? 500,
-                headers: res.headers as Record<string, string>,
-              }),
-            )
-          })
-        },
+        (response) =>
+          resolve(
+            new Response(Readable.toWeb(response) as ReadableStream, {
+              status: response.statusCode ?? 500,
+              headers: response.headers as HeadersInit,
+            }),
+          ),
       )
-      req.on('error', reject)
-      req.write(bodyStr)
-      req.end()
+      request.on('error', reject)
+      request.end(init.body as string | Uint8Array | undefined)
     })
-  }
 }
 
 export interface NextActionResult {
