@@ -163,17 +163,45 @@ export async function readAgentRun(runId: string): Promise<AgentRun | null> {
     const run = JSON.parse(contents) as AgentRun
     if (run.kind !== 'agent' || run.runId !== runId) return null
     if (!run.deviceRuns) return null
-    const validDeviceIds = new Set(run.deviceRuns.map((deviceRun) => deviceRun.deviceId))
-    run.rerunDeviceIds = Array.isArray(run.rerunDeviceIds)
-      ? run.rerunDeviceIds.filter(
-          (deviceId): deviceId is string =>
-            typeof deviceId === 'string' && validDeviceIds.has(deviceId),
-        )
-      : []
-    return run
+    return normalizeAgentRun(run)
   } catch {
     return null
   }
+}
+
+export function normalizeAgentRun(run: AgentRun): AgentRun {
+  if (run.executionMode !== 'leader_broadcast' && run.executionMode !== 'per_device') {
+    run.executionMode = 'per_device'
+  }
+  const configuredDeviceIds = new Set(
+    Array.isArray(run.devices) ? run.devices.map((device) => device.selectionId) : [],
+  )
+  if (run.executionMode === 'leader_broadcast') {
+    run.leaderDeviceId =
+      typeof run.leaderDeviceId === 'string' && configuredDeviceIds.has(run.leaderDeviceId)
+        ? run.leaderDeviceId
+        : (run.devices[0]?.selectionId ?? null)
+  } else {
+    run.leaderDeviceId = null
+  }
+  const validDeviceIds = new Set(run.deviceRuns.map((deviceRun) => deviceRun.deviceId))
+  run.deviceRuns = run.deviceRuns.map((deviceRun) => ({
+    ...deviceRun,
+    steps: (deviceRun.steps ?? []).map((step) => ({
+      ...step,
+      error: typeof step.error === 'string' ? step.error : null,
+      wait: step.wait ?? null,
+      page: step.page ?? null,
+      snapshotMeta: step.snapshotMeta ?? null,
+    })),
+  }))
+  run.rerunDeviceIds = Array.isArray(run.rerunDeviceIds)
+    ? run.rerunDeviceIds.filter(
+        (deviceId): deviceId is string =>
+          typeof deviceId === 'string' && validDeviceIds.has(deviceId),
+      )
+    : []
+  return run
 }
 
 export async function listAgentRuns(): Promise<AgentRun[]> {

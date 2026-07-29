@@ -10,9 +10,11 @@ dist/
 
 # Playwright CLI sessions (console logs, page state)
 apps/server/.playwright-cli/
+.playwright-cli/
 
 # Screenshot and Agent run archives
 data/runs/
+apps/data/
 data/configurations/
 
 # Playwright test artifacts

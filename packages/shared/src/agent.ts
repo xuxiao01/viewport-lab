@@ -14,6 +14,10 @@ export const agentRunStatuses = [
 
 export type AgentRunStatus = (typeof agentRunStatuses)[number]
 
+export const agentExecutionModes = ['per_device', 'leader_broadcast'] as const
+
+export type AgentExecutionMode = (typeof agentExecutionModes)[number]
+
 export const terminalAgentRunStatuses = new Set<AgentRunStatus>([
   'completed',
   'failed',
@@ -36,6 +40,48 @@ export interface AgentStepInfo {
   issues: string[]
 }
 
+export const agentWaitStatuses = ['ready', 'timed_out'] as const
+
+export type AgentWaitStatus = (typeof agentWaitStatuses)[number]
+
+export const agentWaitSignalStatuses = ['ready', 'pending', 'skipped', 'error'] as const
+
+export type AgentWaitSignalStatus = (typeof agentWaitSignalStatuses)[number]
+
+export interface AgentWaitSignal {
+  status: AgentWaitSignalStatus
+  detail: string | null
+}
+
+export interface AgentWaitResult {
+  status: AgentWaitStatus
+  reason: string
+  elapsedMs: number
+  signals: {
+    navigation: AgentWaitSignal
+    network: AgentWaitSignal
+    dom: AgentWaitSignal
+    fonts: AgentWaitSignal
+    images: AgentWaitSignal
+    paint: AgentWaitSignal
+  }
+}
+
+export interface AgentPageState {
+  url: string
+  title: string
+}
+
+export interface AgentSnapshotMeta {
+  snapshotRef: string | null
+  changed: boolean
+  truncated: boolean
+  originalChars: number
+  returnedChars: number
+  sameAsStepIndex: number | null
+  sha256: string | null
+}
+
 export interface DeviceAgentStep {
   stepIndex: number
   command: string
@@ -44,7 +90,11 @@ export interface DeviceAgentStep {
   status: AgentStepStatus
   info: AgentStepInfo | null
   output: string | null
+  error: string | null
+  wait: AgentWaitResult | null
+  page: AgentPageState | null
   snapshot: string | null
+  snapshotMeta: AgentSnapshotMeta | null
   screenshotUrl: string | null
   locator: string | null
   startedAt: string
@@ -70,6 +120,8 @@ export interface DeviceAgentRun {
 
 export interface AgentRun {
   kind: 'agent'
+  executionMode: AgentExecutionMode
+  leaderDeviceId: string | null
   runId: string
   createdAt: string
   updatedAt: string
@@ -89,6 +141,8 @@ export interface AgentRun {
 
 export interface AgentRunSummary {
   kind: 'agent'
+  executionMode: AgentExecutionMode
+  leaderDeviceId: string | null
   runId: string
   createdAt: string
   completedAt: string | null

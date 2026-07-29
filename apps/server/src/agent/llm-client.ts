@@ -1,4 +1,10 @@
-import type { AgentStepInfo, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
+import type {
+  AgentPageState,
+  AgentSnapshotMeta,
+  AgentStepInfo,
+  AgentWaitResult,
+  ScreenshotDevicePresetSnapshot,
+} from '@viewport-lab/shared'
 import http from 'node:http'
 import { Readable } from 'node:stream'
 import OpenAI from 'openai'
@@ -52,7 +58,12 @@ export interface NextActionResult {
 export interface ActionResultReport {
   ok: boolean
   error: string | null
+  command: string
   output: string
+  wait: AgentWaitResult
+  page: AgentPageState
+  snapshot: string | null
+  snapshotMeta: AgentSnapshotMeta | null
   screenshotUrl: string | null
 }
 
@@ -180,7 +191,12 @@ class RealDeviceLlmClient implements DeviceLlmClient {
       content: JSON.stringify({
         ok: report.ok,
         error: report.error,
-        output: report.output.slice(0, 4000),
+        command: report.command,
+        output: report.output,
+        wait: report.wait,
+        page: report.page,
+        snapshot: report.snapshot,
+        snapshotMeta: report.snapshotMeta,
         screenshotUrl: report.screenshotUrl,
       }),
     })
