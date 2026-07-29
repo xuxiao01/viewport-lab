@@ -11,7 +11,7 @@ import type { AgentCliBridge } from './cli-bridge.js'
 import { createCliBridge } from './cli-bridge.js'
 import { readAgentGatewayConfig } from './config.js'
 import type { AgentGatewayConfig } from './config.js'
-import { runDeviceAgent } from './device-agent.js'
+import { runSharedDeviceAgent } from './device-agent.js'
 import {
   clearDeviceArtifacts,
   ensureDeviceDirs,
@@ -23,8 +23,6 @@ export type AgentEventSink = (event: AgentEvent) => void
 export type { AgentEvent } from '@viewport-lab/shared'
 
 const activeRerunIds = new Set<string>()
-const AGENT_DEVICE_CONCURRENCY = 6
-
 export async function startAgentRun(params: {
   url: string
   task: string
@@ -60,6 +58,8 @@ export async function startAgentRun(params: {
 
   const initialRun: AgentRun = {
     kind: 'agent',
+    executionMode: 'leader_broadcast',
+    leaderDeviceId: devices[0]!.selectionId,
     runId,
     createdAt,
     updatedAt: createdAt,
@@ -88,7 +88,6 @@ export async function startAgentRun(params: {
     devices,
     url,
     task,
-    note,
     maxTurns,
     runId,
     gatewayConfig,
@@ -115,14 +114,7 @@ export async function rerunAgentRunInPlace(params: {
   const { sourceRun, scope, emit } = params
   if (activeRerunIds.has(sourceRun.runId)) throw new Error('该 Agent 批次正在重跑')
   activeRerunIds.add(sourceRun.runId)
-  const rerunListIds = new Set(sourceRun.rerunDeviceIds)
-  const selectedDevices = sourceRun.devices.filter((device) => {
-    if (scope === 'all') return true
-    if (scope === 'list') return rerunListIds.has(device.selectionId)
-    return sourceRun.deviceRuns.some(
-      (deviceRun) => deviceRun.deviceId === device.selectionId && deviceRun.status === 'failed',
-    )
-  })
+  const selectedDevices = selectRerunDevices(sourceRun, scope)
   if (selectedDevices.length === 0) {
     activeRerunIds.delete(sourceRun.runId)
     throw new Error(scope === 'list' ? '当前批次的重跑清单为空' : '当前批次没有失败设备')
@@ -137,6 +129,8 @@ export async function rerunAgentRunInPlace(params: {
     const gatewayConfig = readAgentGatewayConfig()
     const initialRun: AgentRun = {
       ...sourceRun,
+      executionMode: 'leader_broadcast',
+      leaderDeviceId: selectedDevices[0]!.selectionId,
       updatedAt: rerunAt,
       completedAt: null,
       status: 'running',
@@ -172,7 +166,6 @@ export async function rerunAgentRunInPlace(params: {
       devices: selectedDevices,
       url: sourceRun.url,
       task: sourceRun.task,
-      note: sourceRun.note,
       maxTurns: sourceRun.maxTurns,
       runId: sourceRun.runId,
       gatewayConfig,
@@ -202,12 +195,25 @@ export async function rerunAgentRunInPlace(params: {
   }
 }
 
+export function selectRerunDevices(
+  sourceRun: AgentRun,
+  scope: RerunScope,
+): ScreenshotDevicePresetSnapshot[] {
+  const rerunListIds = new Set(sourceRun.rerunDeviceIds)
+  return sourceRun.devices.filter((device) => {
+    if (scope === 'all') return true
+    if (scope === 'list') return rerunListIds.has(device.selectionId)
+    return sourceRun.deviceRuns.some(
+      (deviceRun) => deviceRun.deviceId === device.selectionId && deviceRun.status === 'failed',
+    )
+  })
+}
+
 async function runAllDevices(params: {
   recorder: AgentRunRecorder
   devices: ScreenshotDevicePresetSnapshot[]
   url: string
   task: string
-  note: string
   maxTurns: number
   runId: string
   gatewayConfig: AgentGatewayConfig | null
@@ -215,77 +221,70 @@ async function runAllDevices(params: {
   emit: AgentEventSink
 }): Promise<void> {
   const executionStartedAt = Date.now()
-  const { recorder, devices, url, task, note, maxTurns, runId, gatewayConfig, cliBridge, emit } =
-    params
-
-  let nextDeviceIndex = 0
-
-  async function runNextDevices(): Promise<void> {
-    while (true) {
-      const deviceIndex = nextDeviceIndex
-      nextDeviceIndex += 1
-      const device = devices[deviceIndex]
-      if (!device) return
-
-      try {
-        const deviceDirs = await ensureDeviceDirs(runId, device.selectionId)
-        const deviceRun = await runDeviceAgent({
-          device,
-          url,
-          task,
-          note,
-          maxTurns,
-          runId,
-          gatewayConfig,
-          cliBridge,
-          screenshotsDir: deviceDirs.screenshotsDir,
-          snapshotsDir: deviceDirs.snapshotsDir,
-          specDir: deviceDirs.specDir,
-          finalScreenshotPath: deviceDirs.finalScreenshotPath,
-          onDeviceStatus: (deviceId, status, error) => {
-            recorder.setDeviceStatus(deviceId, status, error)
-            recorder.persist().catch(() => undefined)
-            emit({ type: 'device_status', runId, deviceId, status, error })
-            emit({ type: 'status', run: recorder.run })
-          },
-          onDeviceStep: (deviceId, step) => {
-            recorder.appendDeviceStep(deviceId, step)
-            recorder.persist().catch(() => undefined)
-            emit({ type: 'device_step', runId, deviceId, step, run: recorder.run })
-          },
-        })
-        recorder.updateDeviceRun(device.selectionId, deviceRun)
-        await recorder.persist().catch(() => undefined)
-        emit({
-          type: 'device_completed',
-          runId,
-          deviceId: device.selectionId,
-          deviceRun,
-          run: recorder.run,
-        })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        recorder.updateDeviceRun(device.selectionId, {
-          status: 'failed',
-          error: message,
-          durationMs: 0,
-        })
-        await recorder.persist().catch(() => undefined)
-        emit({
-          type: 'device_completed',
-          runId,
-          deviceId: device.selectionId,
-          deviceRun: recorder.run.deviceRuns.find(
-            (deviceRun) => deviceRun.deviceId === device.selectionId,
-          )!,
-          run: recorder.run,
-        })
-      }
-    }
+  const { recorder, devices, url, task, maxTurns, runId, gatewayConfig, cliBridge, emit } = params
+  let persistQueue = Promise.resolve()
+  const queuePersist = (): void => {
+    persistQueue = persistQueue.then(
+      () => recorder.persist(),
+      () => recorder.persist(),
+    )
   }
+  const artifacts = new Map(
+    await Promise.all(
+      devices.map(
+        async (device) =>
+          [device.selectionId, await ensureDeviceDirs(runId, device.selectionId)] as const,
+      ),
+    ),
+  )
 
-  const workerCount = Math.min(AGENT_DEVICE_CONCURRENCY, devices.length)
-  await Promise.all(Array.from({ length: workerCount }, () => runNextDevices()))
+  const deviceRuns = await runSharedDeviceAgent({
+    devices,
+    artifacts,
+    url,
+    task,
+    maxTurns,
+    runId,
+    gatewayConfig,
+    cliBridge,
+    onDeviceStatus: (deviceId, status, error) => {
+      recorder.setDeviceStatus(deviceId, status, error)
+      queuePersist()
+      emit({ type: 'device_status', runId, deviceId, status, error })
+      emit({ type: 'status', run: recorder.run })
+    },
+    onDeviceStep: (deviceId, step) => {
+      recorder.appendDeviceStep(deviceId, step)
+      queuePersist()
+      emit({ type: 'device_step', runId, deviceId, step, run: recorder.run })
+    },
+    onFollowerError: async ({ deviceId, stepIndex, command, error }) => {
+      const message = `从设备 ${deviceId} 第 ${stepIndex} 步 ${command} 执行失败，已跳过：${error}`
+      await recorder.appendEvent({
+        type: 'follower_action_failed',
+        level: 'warn',
+        runId,
+        deviceId,
+        stepIndex,
+        command,
+        error,
+      })
+      emit({ type: 'log', runId, message, level: 'warn' })
+    },
+  })
+
+  await persistQueue
+
+  for (const deviceRun of deviceRuns) {
+    recorder.updateDeviceRun(deviceRun.deviceId, deviceRun)
+    emit({
+      type: 'device_completed',
+      runId,
+      deviceId: deviceRun.deviceId,
+      deviceRun,
+      run: recorder.run,
+    })
+  }
 
   const now = new Date().toISOString()
   const allCompleted = recorder.run.deviceRuns.every((dr) => dr.status === 'completed')

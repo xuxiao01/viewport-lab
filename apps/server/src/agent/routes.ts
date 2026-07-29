@@ -19,9 +19,11 @@ import type {
   RetryDeviceResult,
   RetryRun,
   RetryScreenshot,
+  ScreenshotDevicePresetSnapshot,
   UpdateAgentRerunListRequest,
   UpdateAgentRerunListResponse,
 } from '@viewport-lab/shared'
+import { captureDelayValues, screenshotLimits, screenshotPlatformIds } from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import type { FastifyInstance } from 'fastify'
 
@@ -51,6 +53,13 @@ export function publishAgentEvent(event: AgentEvent): void {
 
 const emit: AgentEventSink = publishAgentEvent
 
+const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
+const selectionIdPattern = /^[a-z0-9][a-z0-9:-]{0,127}$/
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
 function isHttpUrl(value: string): boolean {
   try {
     const parsedUrl = new URL(value)
@@ -60,12 +69,78 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+function parseAgentDevice(value: unknown): ScreenshotDevicePresetSnapshot | null {
+  if (!isRecord(value) || !isRecord(value.viewport)) return null
+  const {
+    selectionId,
+    platformId,
+    platformName,
+    presetId,
+    presetName,
+    viewport,
+    deviceScaleFactor,
+    isMobile,
+    hasTouch,
+    fullPage,
+    readySelector,
+    captureDelayMs,
+  } = value
+  if (
+    typeof selectionId !== 'string' ||
+    !selectionIdPattern.test(selectionId) ||
+    typeof platformId !== 'string' ||
+    !screenshotPlatformIds.includes(platformId as (typeof screenshotPlatformIds)[number]) ||
+    typeof platformName !== 'string' ||
+    platformName.trim().length === 0 ||
+    typeof presetId !== 'string' ||
+    !outputNamePattern.test(presetId) ||
+    typeof presetName !== 'string' ||
+    presetName.trim().length === 0 ||
+    typeof viewport.width !== 'number' ||
+    !Number.isInteger(viewport.width) ||
+    viewport.width < screenshotLimits.viewport.min ||
+    viewport.width > screenshotLimits.viewport.max ||
+    typeof viewport.height !== 'number' ||
+    !Number.isInteger(viewport.height) ||
+    viewport.height < screenshotLimits.viewport.min ||
+    viewport.height > screenshotLimits.viewport.max ||
+    typeof deviceScaleFactor !== 'number' ||
+    !Number.isFinite(deviceScaleFactor) ||
+    deviceScaleFactor < screenshotLimits.deviceScaleFactor.min ||
+    deviceScaleFactor > screenshotLimits.deviceScaleFactor.max ||
+    typeof isMobile !== 'boolean' ||
+    typeof hasTouch !== 'boolean' ||
+    typeof fullPage !== 'boolean' ||
+    typeof readySelector !== 'string' ||
+    !captureDelayValues.includes(captureDelayMs as (typeof captureDelayValues)[number])
+  ) {
+    return null
+  }
+
+  return {
+    selectionId,
+    platformId: platformId as ScreenshotDevicePresetSnapshot['platformId'],
+    platformName: platformName.trim(),
+    presetId,
+    presetName: presetName.trim(),
+    viewport: { width: viewport.width, height: viewport.height },
+    deviceScaleFactor,
+    isMobile,
+    hasTouch,
+    fullPage,
+    readySelector: readySelector.trim(),
+    captureDelayMs: captureDelayMs as ScreenshotDevicePresetSnapshot['captureDelayMs'],
+  }
+}
+
 function toRunSummary(run: AgentRun): AgentRunSummary {
   const completedDeviceCount = run.deviceRuns.filter((dr) => dr.status === 'completed').length
   const failedDeviceCount = run.deviceRuns.filter((dr) => dr.status === 'failed').length
   const stepCount = run.deviceRuns.reduce((sum, dr) => sum + dr.steps.length, 0)
   return {
     kind: 'agent',
+    executionMode: run.executionMode,
+    leaderDeviceId: run.leaderDeviceId,
     runId: run.runId,
     createdAt: run.createdAt,
     completedAt: run.completedAt,
@@ -103,11 +178,19 @@ function parseCreateAgentRunRequest(body: unknown): CreateAgentRunRequest | null
   ) {
     return null
   }
+  const parsedDevices = devices.map(parseAgentDevice)
+  if (parsedDevices.some((device) => device === null)) return null
+  const validDevices = parsedDevices.filter(
+    (device): device is ScreenshotDevicePresetSnapshot => device !== null,
+  )
+  if (new Set(validDevices.map((device) => device.selectionId)).size !== validDevices.length) {
+    return null
+  }
   return {
     url,
     task: task.trim(),
     note: note.trim(),
-    devices: devices as CreateAgentRunRequest['devices'],
+    devices: validDevices,
     maxTurns,
   }
 }

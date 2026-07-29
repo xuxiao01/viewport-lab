@@ -29,6 +29,9 @@ Viewport Lab 是一个本地运行的全栈工具，用于在多种手机、平�
 - 创建任务表单使用 `localStorage` 自动保存，刷新页面后恢复最近一次配置。
 - 使用 SSE 推送任务进度；普通截图连接异常时可降级为轮询。
 - 截图与 Agent 运行统一归档到 `data/runs`，配置快照存放在 `data/configurations`。
+- Agent 由首台主设备进行模型决策，并将有效操作同步重放到其余设备，确保相同业务状态下的多视口结果。
+- 每步操作后分别等待 URL、加载、网络、DOM、字体、可见图片与连续渲染帧稳定，并保存 accessibility 快照和截图。
+- Agent 快照通过 SHA-256 去重，模型侧单次上下文最多保留 40,000 字符。
 
 ## 运行模式
 
@@ -43,9 +46,9 @@ AI 任务描述为空时，系统按照选中的设备参数直接打开目标�
 
 ### Agent 探索
 
-填写 AI 任务描述后，系统会为每个设备创建独立 Agent。Agent 根据当前页面快照调用 Playwright CLI，执行点击、输入、导航和查找等操作，并在每一步后保存截图。
+填写 AI 任务描述后，首台设备作为主设备进行模型决策；其余设备重放相同的 Playwright CLI 操作。每个设备独立执行页面等待、快照与截图，从而在相同业务流程下比较不同视口结果。
 
-Agent 的操作由模型动态规划，结果可能受到页面状态、网络、弹窗、登录态和模型判断影响。任务描述应明确写出目标页面、必要步骤、最终状态和停止条件。
+Agent 的操作由模型动态规划，结果仍会受到页面状态、网络、弹窗和登录态影响。任务描述应明确写出目标页面、必要步骤、最终状态和停止条件；从设备单步失败会保留 warning 与证据，并继续接收后续操作。
 
 ## 设备视口
 
@@ -230,6 +233,8 @@ data/runs/{YYYY-MM-DD_HH-mm-ss-SSS_随机ID}/
 - 普通截图的 PNG 保存在批次根目录。
 - Agent 的设备最终截图保存在批次根目录。
 - Agent 的逐步截图、页面快照和测试脚本保存在 `agent/{deviceId}`。
+- Agent 以请求的第一台设备为主设备：模型只读取主设备的工具结果，其他设备原样重放操作；从设备单步失败会保留 warning 并继续后续操作。
+- 每台设备独立完成页面就绪等待、快照和截图。完整快照写入 `snapshots/`，相同快照使用哈希复用；超过 40,000 字符的模型侧快照会标记截断。
 - 配置快照独立保存到 `data/configurations/{配置ID}.json`。
 - API Key、VHost 等网关凭证不会写入运行归档。
 
@@ -243,6 +248,7 @@ data/runs/{YYYY-MM-DD_HH-mm-ss-SSS_随机ID}/
 | `pnpm build`                               | 构建全部 workspace 包                  |
 | `pnpm typecheck`                           | 构建共享声明并执行 TypeScript 类型检查 |
 | `pnpm lint`                                | 执行 ESLint                            |
+| `pnpm --filter @viewport-lab/server test`  | 执行 Agent 协调器测试                  |
 | `pnpm format`                              | 使用 Prettier 格式化项目               |
 | `pnpm format:check`                        | 检查 Prettier 格式                     |
 | `pnpm --filter @viewport-lab/server start` | 运行已构建的服务端                     |

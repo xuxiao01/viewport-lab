@@ -25,6 +25,8 @@ const terminalStatuses = new Set<AgentRun['status']>(['completed', 'failed', 'ca
 function toRunSummary(run: AgentRun): AgentRunSummary {
   return {
     kind: 'agent',
+    executionMode: run.executionMode,
+    leaderDeviceId: run.leaderDeviceId,
     runId: run.runId,
     createdAt: run.createdAt,
     completedAt: run.completedAt,

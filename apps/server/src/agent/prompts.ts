@@ -75,7 +75,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     function: {
       name: 'run_cli',
       description:
-        '执行一个 Playwright CLI 浏览器命令。系统会在命令完成后自动截图（snapshot 命令除外）。',
+        '执行一个 Playwright CLI 浏览器命令。系统会在命令后自动等待页面稳定，并返回最新快照与截图。通常不需要主动调用 snapshot。',
       parameters: {
         type: 'object',
         properties: {

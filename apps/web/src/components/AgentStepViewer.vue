@@ -50,6 +50,22 @@ function move(offset: number): void {
 function formatDuration(value: number): string {
   return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} 秒`
 }
+
+function executionRole(deviceId: string): string {
+  if (props.run?.executionMode === 'per_device') return '独立 Agent'
+  return props.run?.leaderDeviceId === deviceId ? 'Agent 主设备' : '复用执行'
+}
+
+function waitLabel(status: 'ready' | 'timed_out'): string {
+  return status === 'ready' ? '页面已就绪' : '等待超时'
+}
+
+function snapshotLabel(step: DeviceAgentStep): string {
+  const meta = step.snapshotMeta
+  if (!meta) return '—'
+  if (!meta.changed) return `未变化，与第 ${meta.sameAsStepIndex ?? 0} 步相同`
+  return `${meta.returnedChars.toLocaleString()} / ${meta.originalChars.toLocaleString()} 字符${meta.truncated ? '（已达上限）' : ''}`
+}
 </script>
 
 <template>
@@ -70,7 +86,8 @@ function formatDuration(value: number): string {
           :class="{ active: device.deviceId === selectedDeviceId }"
           @click="selectedDeviceId = device.deviceId"
         >
-          {{ device.presetName }}
+          <span class="device-name">{{ device.presetName }}</span>
+          <span class="device-role">{{ executionRole(device.deviceId) }}</span>
           <span>{{ device.steps.length }} 步</span>
         </button>
       </div>
@@ -135,6 +152,27 @@ function formatDuration(value: number): string {
               <dt>工具输出</dt>
               <dd class="code-output">{{ selectedStep.output }}</dd>
             </div>
+            <div v-if="selectedStep.wait">
+              <dt>页面等待</dt>
+              <dd>
+                <span :class="['wait-state', selectedStep.wait.status]">
+                  {{ waitLabel(selectedStep.wait.status) }}
+                </span>
+                · {{ selectedStep.wait.reason }} · {{ formatDuration(selectedStep.wait.elapsedMs) }}
+              </dd>
+            </div>
+            <div v-if="selectedStep.page">
+              <dt>页面状态</dt>
+              <dd>{{ selectedStep.page.title || '无标题' }} · {{ selectedStep.page.url }}</dd>
+            </div>
+            <div v-if="selectedStep.snapshotMeta">
+              <dt>页面快照</dt>
+              <dd>{{ snapshotLabel(selectedStep) }}</dd>
+            </div>
+            <div v-if="selectedStep.snapshot">
+              <dt>快照内容</dt>
+              <dd class="code-output snapshot-output">{{ selectedStep.snapshot }}</dd>
+            </div>
           </dl>
 
           <footer>
@@ -189,6 +227,17 @@ function formatDuration(value: number): string {
 .device-tabs span {
   color: var(--color-text-muted);
   font-size: 11px;
+}
+
+.device-tabs .device-name {
+  color: inherit;
+  font-size: 13px;
+}
+
+.device-tabs .device-role {
+  color: var(--color-primary-dark);
+  font-size: 10px;
+  font-weight: 650;
 }
 
 .step-layout {
@@ -342,6 +391,22 @@ em.failed {
   border-radius: 7px;
   background: var(--color-surface-subtle);
   white-space: pre-wrap;
+}
+
+.snapshot-output {
+  max-height: 260px;
+}
+
+.wait-state {
+  font-weight: 650;
+}
+
+.wait-state.ready {
+  color: var(--color-success);
+}
+
+.wait-state.timed_out {
+  color: var(--color-warning, #9a6700);
 }
 
 .step-detail footer {

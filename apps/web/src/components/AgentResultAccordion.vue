@@ -45,6 +45,15 @@ function isInRerunList(deviceId: string): boolean {
   return props.run.rerunDeviceIds.includes(deviceId)
 }
 
+function executionRole(deviceId: string): string {
+  if (props.run.executionMode === 'per_device') return '独立 Agent'
+  return props.run.leaderDeviceId === deviceId ? 'Agent 主设备' : '复用执行'
+}
+
+function failedStepCount(device: DeviceAgentRun): number {
+  return device.steps.filter((step) => step.status === 'failed').length
+}
+
 function statusLabel(status: AgentRunStatus): string {
   const labels: Partial<Record<AgentRunStatus, string>> = {
     queued: '等待',
@@ -70,7 +79,7 @@ function formatTime(value: string | null): string {
     <div class="results-heading">
       <div>
         <h2>设备截图</h2>
-        <p>主卡片仅展示 Agent 运行结束时的最终页面状态</p>
+        <p>一台主设备负责 Agent 决策，其余设备同步复用工具调用</p>
       </div>
     </div>
 
@@ -116,7 +125,15 @@ function formatTime(value: string | null): string {
 
             <div class="card-body">
               <div class="title-row">
-                <h3>{{ device.presetName }}</h3>
+                <div class="device-title">
+                  <h3>{{ device.presetName }}</h3>
+                  <span
+                    class="role-label"
+                    :class="{ leader: run.leaderDeviceId === device.deviceId }"
+                  >
+                    {{ executionRole(device.deviceId) }}
+                  </span>
+                </div>
                 <span class="status-badge" :class="device.status">
                   {{ statusLabel(device.status) }}
                 </span>
@@ -132,6 +149,10 @@ function formatTime(value: string | null): string {
                 <div>
                   <dt>运行步骤</dt>
                   <dd>{{ device.steps.length }} 步</dd>
+                </div>
+                <div v-if="failedStepCount(device) > 0">
+                  <dt>失败调用</dt>
+                  <dd class="failed-count">{{ failedStepCount(device) }} 次</dd>
                 </div>
                 <div>
                   <dt>DPR</dt>
@@ -307,6 +328,22 @@ function formatTime(value: string | null): string {
   font-size: 14px;
 }
 
+.device-title {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.role-label {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.role-label.leader {
+  color: var(--color-primary-dark);
+}
+
 .status-badge {
   padding: 3px 7px;
   border-radius: 999px;
@@ -347,6 +384,11 @@ dd {
 dd {
   color: var(--color-text-secondary);
   text-align: right;
+}
+
+.failed-count {
+  color: var(--color-danger);
+  font-weight: 650;
 }
 
 .device-error {

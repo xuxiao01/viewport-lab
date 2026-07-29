@@ -18,6 +18,7 @@ export interface AgentCliBridge {
   snapshot(session: string, filename?: string): Promise<CliResult>
   screenshot(session: string, filename: string, fullPage?: boolean): Promise<CliResult>
   generateLocator(session: string, ref: string): Promise<CliResult>
+  runCode(session: string, code: string): Promise<CliResult>
   execute(session: string, command: string, args: string[]): Promise<CliResult>
   close(session: string): Promise<CliResult>
   closeAll(): Promise<void>
@@ -83,6 +84,10 @@ class ConcreteCliBridge implements AgentCliBridge {
 
   async generateLocator(session: string, ref: string): Promise<CliResult> {
     return this.exec(session, 'generate-locator', [ref])
+  }
+
+  async runCode(session: string, code: string): Promise<CliResult> {
+    return this.exec(session, 'run-code', [code])
   }
 
   async execute(session: string, command: string, args: string[]): Promise<CliResult> {
@@ -178,7 +183,7 @@ class ConcreteCliBridge implements AgentCliBridge {
             }
             resolvePromise({
               ok: true,
-              output: outputText.slice(0, 18000),
+              output: outputText,
               error: null,
             })
             return
