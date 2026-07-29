@@ -190,7 +190,9 @@ export const useRunStore = defineStore('run', () => {
   const selectedBatch = ref<BatchManifest | null>(null)
   const historyLoading = ref(false)
   const detailLoading = ref(false)
+  const creating = ref(false)
   const historyError = ref<string | null>(null)
+  const activeBatches = ref<Record<string, BatchManifest>>({})
   const comparison = ref<ScreenshotComparisonSelection>({
     baselineBatchId: null,
     comparisonBatchId: null,
@@ -206,7 +208,7 @@ export const useRunStore = defineStore('run', () => {
   const progressPercentage = computed(() =>
     totalCount.value === 0 ? 0 : Math.round((completedCount.value / totalCount.value) * 100),
   )
-  const isRunning = computed(() => tasks.value.some((task) => !terminalStatuses.has(task.status)))
+  const isRunning = computed(() => Object.keys(activeBatches.value).length > 0)
   const selectedTasks = computed(() => {
     const batch = selectedBatch.value
     if (!batch) return []
@@ -269,13 +271,16 @@ export const useRunStore = defineStore('run', () => {
     ].sort((left, right) => right.createdAt.localeCompare(left.createdAt))
   }
 
-  function syncCurrentBatch(run: RunManifest): void {
-    const batch = currentBatch.value
-    if (!batch || batch.batchId !== run.request.batchId) return
+  function syncBatch(run: RunManifest): BatchManifest | null {
+    const batch =
+      activeBatches.value[run.request.batchId] ??
+      (currentBatch.value?.batchId === run.request.batchId ? currentBatch.value : null) ??
+      (selectedBatch.value?.batchId === run.request.batchId ? selectedBatch.value : null)
+    if (!batch) return null
     const index = batch.devices.findIndex(
       (device) => device.selectionId === run.request.selectionId,
     )
-    if (index < 0) return
+    if (index < 0) return null
     const devices = [...batch.devices]
     devices[index] = {
       ...devices[index]!,
@@ -289,21 +294,25 @@ export const useRunStore = defineStore('run', () => {
       error: run.error,
     }
     const updated = aggregateBatch({ ...batch, devices, completedAt: null }, run.updatedAt)
-    currentBatch.value = updated
+    if (terminalBatchStatuses.has(updated.status)) {
+      const remaining = { ...activeBatches.value }
+      delete remaining[updated.batchId]
+      activeBatches.value = remaining
+    } else {
+      activeBatches.value = { ...activeBatches.value, [updated.batchId]: updated }
+    }
+    if (currentBatch.value?.batchId === updated.batchId) currentBatch.value = updated
     if (selectedBatchId.value === updated.batchId) selectedBatch.value = updated
     upsertSummary(updated)
+    return updated
   }
 
-  function stopWatching(taskId: string): void {
-    eventSources.get(taskId)?.close()
-    eventSources.delete(taskId)
-    const timer = pollTimers.get(taskId)
+  function stopWatching(runId: string): void {
+    eventSources.get(runId)?.close()
+    eventSources.delete(runId)
+    const timer = pollTimers.get(runId)
     if (timer !== undefined) window.clearTimeout(timer)
-    pollTimers.delete(taskId)
-  }
-
-  function stopAllWatching(): void {
-    for (const task of tasks.value) stopWatching(task.id)
+    pollTimers.delete(runId)
   }
 
   async function fetchBatchDetail(id: string): Promise<BatchManifest> {
@@ -320,6 +329,13 @@ export const useRunStore = defineStore('run', () => {
       if (batchId.value === id) currentBatch.value = batch
       if (selectedBatchId.value === id) selectedBatch.value = batch
       upsertSummary(batch)
+      if (terminalBatchStatuses.has(batch.status)) {
+        const remaining = { ...activeBatches.value }
+        delete remaining[id]
+        activeBatches.value = remaining
+      } else {
+        activeBatches.value = { ...activeBatches.value, [id]: batch }
+      }
     } catch {
       // The live task cards already contain the final result; history can recover on refresh.
     } finally {
@@ -327,13 +343,13 @@ export const useRunStore = defineStore('run', () => {
     }
   }
 
-  function applyRun(taskId: string, run: RunManifest): void {
-    updateTask(taskId, { run, status: run.status, error: run.error })
-    syncCurrentBatch(run)
-    if (terminalStatuses.has(run.status)) stopWatching(taskId)
-    if (tasks.value.length > 0 && tasks.value.every((task) => terminalStatuses.has(task.status))) {
-      void finalizeCurrentBatch(run.request.batchId)
+  function applyRun(run: RunManifest): void {
+    if (batchId.value === run.request.batchId) {
+      updateTask(run.request.selectionId, { run, status: run.status, error: run.error })
     }
+    const batch = syncBatch(run)
+    if (terminalStatuses.has(run.status)) stopWatching(run.runId)
+    if (batch && terminalBatchStatuses.has(batch.status)) void finalizeCurrentBatch(batch.batchId)
   }
 
   async function readApiError(response: Response, fallback: string): Promise<string> {
@@ -346,41 +362,47 @@ export const useRunStore = defineStore('run', () => {
     return fallback
   }
 
-  async function fetchRun(taskId: string, runId: string): Promise<void> {
+  async function fetchRun(runId: string): Promise<void> {
     const response = await fetch(`/api/runs/${runId}`)
     if (!response.ok) throw new Error('无法获取截图任务')
-    applyRun(taskId, (await response.json()) as RunManifest)
+    applyRun((await response.json()) as RunManifest)
   }
 
-  function startPolling(taskId: string, runId: string): void {
-    stopWatching(taskId)
+  function startPolling(runId: string): void {
+    stopWatching(runId)
     const poll = async (): Promise<void> => {
       try {
-        await fetchRun(taskId, runId)
-        const task = findTask(taskId)
-        if (!task || terminalStatuses.has(task.status)) return
+        await fetchRun(runId)
+        const batch = Object.values(activeBatches.value).find((item) =>
+          item.devices.some((device) => device.runId === runId),
+        )
+        const device = batch?.devices.find((item) => item.runId === runId)
+        if (!device || terminalStatuses.has(device.status)) return
       } catch {
         // A later poll may recover from a transient development-server restart.
       }
       pollTimers.set(
-        taskId,
+        runId,
         window.setTimeout(() => void poll(), 1000),
       )
     }
     void poll()
   }
 
-  function watchRun(taskId: string, runId: string): void {
-    stopWatching(taskId)
+  function watchRun(runId: string): void {
+    if (eventSources.has(runId) || pollTimers.has(runId)) return
     const eventSource = new EventSource(`/api/runs/${runId}/events`)
-    eventSources.set(taskId, eventSource)
+    eventSources.set(runId, eventSource)
     eventSource.addEventListener('status', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as RunEvent
-      applyRun(taskId, event.run)
+      applyRun(event.run)
     })
     eventSource.onerror = () => {
-      const task = findTask(taskId)
-      if (task && !terminalStatuses.has(task.status)) startPolling(taskId, runId)
+      const batch = Object.values(activeBatches.value).find((item) =>
+        item.devices.some((device) => device.runId === runId),
+      )
+      const device = batch?.devices.find((item) => item.runId === runId)
+      if (device && !terminalStatuses.has(device.status)) startPolling(runId)
     }
   }
 
@@ -464,13 +486,31 @@ export const useRunStore = defineStore('run', () => {
       })
       if (!response.ok) throw new Error(await readApiError(response, '创建截图任务失败'))
       const body = (await response.json()) as CreateRunResponse
-      applyRun(taskId, body.run)
-      watchRun(taskId, body.run.runId)
+      applyRun(body.run)
+      watchRun(body.run.runId)
     } catch (error) {
-      updateTask(taskId, {
-        status: 'failed',
-        error: error instanceof Error ? error.message : '创建截图任务失败',
-      })
+      const message = error instanceof Error ? error.message : '创建截图任务失败'
+      if (batchId.value === currentBatchId) updateTask(taskId, { status: 'failed', error: message })
+      const batch = activeBatches.value[currentBatchId]
+      if (batch) {
+        const now = new Date().toISOString()
+        const devices = batch.devices.map((device) =>
+          device.selectionId === taskId
+            ? { ...device, status: 'failed' as const, error: message, updatedAt: now, completedAt: now }
+            : device,
+        )
+        const updated = aggregateBatch({ ...batch, devices }, now)
+        if (terminalBatchStatuses.has(updated.status)) {
+          const remaining = { ...activeBatches.value }
+          delete remaining[currentBatchId]
+          activeBatches.value = remaining
+        } else {
+          activeBatches.value = { ...activeBatches.value, [currentBatchId]: updated }
+        }
+        if (currentBatch.value?.batchId === currentBatchId) currentBatch.value = updated
+        if (selectedBatchId.value === currentBatchId) selectedBatch.value = updated
+        upsertSummary(updated)
+      }
     }
   }
 
@@ -480,37 +520,32 @@ export const useRunStore = defineStore('run', () => {
     captureDelayMs: CaptureDelayMs,
     devices: ScreenshotDevicePresetSnapshot[],
   ): Promise<void> {
-    if (isRunning.value) throw new Error('当前已有截图批次正在运行')
     if (devices.length === 0) throw new Error('截图批次至少需要一个设备预设')
 
-    stopAllWatching()
-    batchUrl.value = url
-    batchId.value = ''
-    batchCaptureDelayMs.value = captureDelayMs
-    currentBatch.value = null
-    const normalizedDevices = devices.map((device) =>
-      normalizeDeviceSnapshot(device, captureDelayMs),
-    )
-    tasks.value = normalizedDevices.map(queuedTaskFromSnapshot)
-
+    creating.value = true
     try {
+      const normalizedDevices = devices.map((device) =>
+        normalizeDeviceSnapshot(device, captureDelayMs),
+      )
       const batch = await createBatch(url, note, captureDelayMs, normalizedDevices)
+      batchUrl.value = url
       batchId.value = batch.batchId
+      batchCaptureDelayMs.value = captureDelayMs
       currentBatch.value = batch
       selectedBatchId.value = batch.batchId
       selectedBatch.value = batch
+      tasks.value = normalizedDevices.map(queuedTaskFromSnapshot)
+      activeBatches.value = { ...activeBatches.value, [batch.batchId]: batch }
       upsertSummary(batch)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '创建批次失败'
-      for (const task of tasks.value) updateTask(task.id, { status: 'failed', error: message })
-      throw error
-    }
 
-    await Promise.all(
-      tasks.value.map((task) =>
-        launchTask(task.id, url, task.preset, batchId.value, captureDelayMs),
-      ),
-    )
+      await Promise.all(
+        tasks.value.map((task) =>
+          launchTask(task.id, url, task.preset, batch.batchId, captureDelayMs),
+        ),
+      )
+    } finally {
+      creating.value = false
+    }
   }
 
   async function startBatch(
@@ -531,61 +566,65 @@ export const useRunStore = defineStore('run', () => {
   }
 
   async function rerunBatch(id: string, scope: RerunScope = 'all'): Promise<void> {
-    if (isRunning.value) throw new Error('当前已有截图批次正在运行')
-    stopAllWatching()
-    const previousBatch = selectedBatch.value?.batchId === id ? selectedBatch.value : null
-    const previousDevices = new Map(
-      previousBatch?.devices.map((device) => [device.selectionId, device]) ?? [],
-    )
-    const previousTasks = new Map(
-      (batchId.value === id
-        ? tasks.value
-        : (previousBatch?.devices.map((device) => taskFromDevice(previousBatch, device)) ?? [])
-      ).map((task) => [task.id, task]),
-    )
-    const response = await fetch(`/api/batches/${id}/rerun`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scope }),
-    })
-    if (!response.ok) throw new Error(await readApiError(response, '重跑截图批次失败'))
+    creating.value = true
+    try {
+      const previousBatch = selectedBatch.value?.batchId === id ? selectedBatch.value : null
+      const previousDevices = new Map(
+        previousBatch?.devices.map((device) => [device.selectionId, device]) ?? [],
+      )
+      const previousTasks = new Map(
+        (batchId.value === id
+          ? tasks.value
+          : (previousBatch?.devices.map((device) => taskFromDevice(previousBatch, device)) ?? [])
+        ).map((task) => [task.id, task]),
+      )
+      const response = await fetch(`/api/batches/${id}/rerun`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      })
+      if (!response.ok) throw new Error(await readApiError(response, '重跑截图批次失败'))
 
-    const { batch, selectionIds } = (await response.json()) as RerunBatchResponse
-    const selectedIdSet = new Set(selectionIds)
-    const mergedBatch: BatchManifest = {
-      ...batch,
-      devices: batch.devices.map((device) =>
-        selectedIdSet.has(device.selectionId)
-          ? device
-          : (previousDevices.get(device.selectionId) ?? device),
-      ),
-    }
-    batchUrl.value = batch.url
-    batchId.value = batch.batchId
-    batchCaptureDelayMs.value = batch.captureDelayMs ?? 0
-    currentBatch.value = mergedBatch
-    selectedBatchId.value = mergedBatch.batchId
-    selectedBatch.value = mergedBatch
-    tasks.value = mergedBatch.devices.map((device) =>
-      selectedIdSet.has(device.selectionId)
-        ? taskFromDevice(mergedBatch, device)
-        : (previousTasks.get(device.selectionId) ?? taskFromDevice(mergedBatch, device)),
-    )
-    upsertSummary(mergedBatch)
-
-    await Promise.all(
-      tasks.value
-        .filter((task) => selectedIdSet.has(task.id))
-        .map((task) =>
-          launchTask(task.id, batch.url, task.preset, batch.batchId, batch.captureDelayMs ?? 0),
+      const { batch, selectionIds } = (await response.json()) as RerunBatchResponse
+      const selectedIdSet = new Set(selectionIds)
+      const mergedBatch: BatchManifest = {
+        ...batch,
+        devices: batch.devices.map((device) =>
+          selectedIdSet.has(device.selectionId)
+            ? device
+            : (previousDevices.get(device.selectionId) ?? device),
         ),
-    )
+      }
+      batchUrl.value = batch.url
+      batchId.value = batch.batchId
+      batchCaptureDelayMs.value = batch.captureDelayMs ?? 0
+      currentBatch.value = mergedBatch
+      selectedBatchId.value = mergedBatch.batchId
+      selectedBatch.value = mergedBatch
+      tasks.value = mergedBatch.devices.map((device) =>
+        selectedIdSet.has(device.selectionId)
+          ? taskFromDevice(mergedBatch, device)
+          : (previousTasks.get(device.selectionId) ?? taskFromDevice(mergedBatch, device)),
+      )
+      activeBatches.value = { ...activeBatches.value, [mergedBatch.batchId]: mergedBatch }
+      upsertSummary(mergedBatch)
+
+      await Promise.all(
+        tasks.value
+          .filter((task) => selectedIdSet.has(task.id))
+          .map((task) =>
+            launchTask(task.id, batch.url, task.preset, batch.batchId, batch.captureDelayMs ?? 0),
+          ),
+      )
+    } finally {
+      creating.value = false
+    }
   }
 
   async function retryTask(taskId: string): Promise<void> {
     const task = findTask(taskId)
     if (!task || task.status !== 'failed' || !batchUrl.value || !batchId.value) return
-    stopWatching(taskId)
+    if (task.run?.runId) stopWatching(task.run.runId)
     updateTask(taskId, { status: 'queued', run: null, error: null })
     await launchTask(
       taskId,
@@ -603,6 +642,25 @@ export const useRunStore = defineStore('run', () => {
       const response = await fetch('/api/batches')
       if (!response.ok) throw new Error(await readApiError(response, '无法加载截图历史'))
       batchHistory.value = ((await response.json()) as ListBatchesResponse).batches
+      const activeSummaries = batchHistory.value.filter(
+        (batch) => !terminalBatchStatuses.has(batch.status),
+      )
+      const activeDetails = await Promise.all(
+        activeSummaries.map(async (batch) => {
+          try {
+            return await fetchBatchDetail(batch.batchId)
+          } catch {
+            return null
+          }
+        }),
+      )
+      for (const batch of activeDetails) {
+        if (!batch) continue
+        activeBatches.value = { ...activeBatches.value, [batch.batchId]: batch }
+        for (const device of batch.devices) {
+          if (device.runId && !terminalStatuses.has(device.status)) watchRun(device.runId)
+        }
+      }
       if (!selectedBatchId.value && batchHistory.value[0]) {
         await selectBatch(batchHistory.value[0].batchId)
       }
@@ -634,9 +692,44 @@ export const useRunStore = defineStore('run', () => {
     }
   }
 
+  async function updateBatchNote(id: string, note: string): Promise<BatchManifest> {
+    const response = await fetch(`/api/batches/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: note.trim() }),
+    })
+    if (!response.ok) throw new Error(await readApiError(response, '修改任务标题失败'))
+    const batch = (await response.json()) as BatchManifest
+    if (currentBatch.value?.batchId === id) {
+      currentBatch.value = { ...currentBatch.value, note: batch.note }
+    }
+    if (selectedBatchId.value === id && selectedBatch.value) {
+      selectedBatch.value = { ...selectedBatch.value, note: batch.note }
+    }
+    if (activeBatches.value[id]) {
+      activeBatches.value = {
+        ...activeBatches.value,
+        [id]: { ...activeBatches.value[id], note: batch.note },
+      }
+    }
+    batchHistory.value = batchHistory.value.map((item) =>
+      item.batchId === id ? { ...item, note: batch.note } : item,
+    )
+    return selectedBatch.value?.batchId === id ? selectedBatch.value : batch
+  }
+
   async function deleteBatch(id: string): Promise<void> {
     const response = await fetch(`/api/batches/${id}`, { method: 'DELETE' })
     if (!response.ok) throw new Error(await readApiError(response, '删除截图批次失败'))
+    const active = activeBatches.value[id]
+    if (active) {
+      for (const device of active.devices) {
+        if (device.runId) stopWatching(device.runId)
+      }
+      const remaining = { ...activeBatches.value }
+      delete remaining[id]
+      activeBatches.value = remaining
+    }
     const deletedIndex = batchHistory.value.findIndex((batch) => batch.batchId === id)
     batchHistory.value = batchHistory.value.filter((batch) => batch.batchId !== id)
     if (comparison.value.baselineBatchId === id) comparison.value.baselineBatchId = null
@@ -671,6 +764,7 @@ export const useRunStore = defineStore('run', () => {
     selectedTasks,
     historyLoading,
     detailLoading,
+    creating,
     historyError,
     comparison,
     comparisonCandidates,
@@ -686,6 +780,7 @@ export const useRunStore = defineStore('run', () => {
     retryTask,
     loadHistory,
     selectBatch,
+    updateBatchNote,
     deleteBatch,
     setBaselineBatch,
     setComparisonBatch,

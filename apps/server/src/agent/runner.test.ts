@@ -43,7 +43,17 @@ test('normalizes missing page observation fields in legacy steps', () => {
   assert.equal(step?.snapshotMeta, null)
 })
 
-test('keeps rerun device ordering so the first selected device can lead the rerun', () => {
+test('keeps the single-agent resize execution mode and its configured leader', () => {
+  const run = makeRun()
+  run.executionMode = 'leader_resize_capture'
+
+  const normalized = normalizeAgentRun(run)
+
+  assert.equal(normalized.executionMode, 'leader_resize_capture')
+  assert.equal(normalized.leaderDeviceId, 'device-a')
+})
+
+test('keeps rerun device ordering while retaining the original leader separately', () => {
   const run = makeRun()
   run.rerunDeviceIds = ['device-c', 'device-b']
   run.deviceRuns[1]!.status = 'failed'

@@ -8,8 +8,9 @@ import type {
   DeviceAgentRun,
   RerunScope,
 } from '@viewport-lab/shared'
+import { batchNoteMaxLength } from '@viewport-lab/shared'
 import { ElMessageBox } from 'element-plus'
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import AgentResultAccordion from './AgentResultAccordion.vue'
 import ResultAccordion from './ResultAccordion.vue'
@@ -51,6 +52,12 @@ const emit = defineEmits<{
   viewAgent: [device: DeviceAgentRun]
   viewAgentSteps: [device: DeviceAgentRun]
   toggleAgentRerunList: [device: DeviceAgentRun, included: boolean]
+  updateTitle: [
+    kind: 'viewport' | 'agent',
+    runId: string,
+    note: string,
+    settled: (success: boolean) => void,
+  ]
   'update:baselineBatchId': [batchId: string | null]
   'update:comparisonBatchId': [batchId: string | null]
 }>()
@@ -84,6 +91,53 @@ const agentRerunListCount = computed(() => {
   const validDeviceIds = new Set(props.agentRun.deviceRuns.map((deviceRun) => deviceRun.deviceId))
   return props.agentRun.rerunDeviceIds.filter((deviceId) => validDeviceIds.has(deviceId)).length
 })
+const editingTitleKey = ref<string | null>(null)
+const titleDraft = ref('')
+const titleSaving = ref(false)
+
+watch(
+  () => `${props.selectedKind}:${props.selectedKind === 'viewport' ? props.batch?.batchId : props.agentRun?.runId}`,
+  () => {
+    editingTitleKey.value = null
+    titleDraft.value = ''
+    titleSaving.value = false
+  },
+)
+
+function titleKey(kind: 'viewport' | 'agent', runId: string): string {
+  return `${kind}:${runId}`
+}
+
+async function startTitleEdit(
+  kind: 'viewport' | 'agent',
+  runId: string,
+  note: string,
+): Promise<void> {
+  editingTitleKey.value = titleKey(kind, runId)
+  titleDraft.value = note
+  await nextTick()
+  document.querySelector<HTMLInputElement>('.title-editor input')?.focus()
+}
+
+function cancelTitleEdit(): void {
+  if (titleSaving.value) return
+  editingTitleKey.value = null
+  titleDraft.value = ''
+}
+
+function saveTitle(kind: 'viewport' | 'agent', runId: string, originalNote: string): void {
+  if (titleSaving.value) return
+  const note = titleDraft.value.trim()
+  if (note === originalNote.trim()) {
+    cancelTitleEdit()
+    return
+  }
+  titleSaving.value = true
+  emit('updateTitle', kind, runId, note, (success) => {
+    titleSaving.value = false
+    if (success) cancelTitleEdit()
+  })
+}
 
 function isSelected(item: UnifiedHistoryItem): boolean {
   if (item.kind !== props.selectedKind) return false
@@ -98,23 +152,19 @@ function selectItem(item: UnifiedHistoryItem): void {
 }
 
 function historyStatus(item: UnifiedHistoryItem): string {
-  return item.summary.status
+  if (item.kind === 'viewport') return item.summary.status
+  if (item.summary.status === 'queued') return 'queued'
+  if (item.summary.status === 'completed') return 'completed'
+  if (item.summary.status === 'failed' || item.summary.status === 'cancelled') return 'failed'
+  return 'running'
 }
 
 function historyStatusLabel(item: UnifiedHistoryItem): string {
   if (item.kind === 'viewport') return statusLabels[item.summary.status]
-  const labels: Partial<Record<AgentRunSummary['status'], string>> = {
-    queued: '等待中',
-    launching: '启动中',
-    running: '运行中',
-    awaiting_gateway: '等待模型',
-    executing: '执行中',
-    capturing: '截图中',
-    completed: '成功',
-    failed: '异常',
-    cancelled: '已取消',
-  }
-  return labels[item.summary.status] ?? item.summary.status
+  if (item.summary.status === 'queued') return '等待中'
+  if (item.summary.status === 'completed') return '成功'
+  if (item.summary.status === 'failed' || item.summary.status === 'cancelled') return '异常'
+  return '进行中'
 }
 
 function historyNote(item: UnifiedHistoryItem): string {
@@ -357,7 +407,46 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
                 <span class="status-badge" :class="batch.status">
                   {{ statusLabels[batch.status] }}
                 </span>
-                <strong>{{ batch.note || '未填写备注' }}</strong>
+                <div
+                  v-if="editingTitleKey === titleKey('viewport', batch.batchId)"
+                  class="title-editor"
+                >
+                  <el-input
+                    v-model="titleDraft"
+                    :maxlength="batchNoteMaxLength"
+                    :disabled="titleSaving"
+                    placeholder="请输入任务标题"
+                    @keyup.enter.prevent="saveTitle('viewport', batch.batchId, batch.note)"
+                    @keyup.esc.prevent="cancelTitleEdit"
+                  />
+                  <button
+                    type="button"
+                    class="title-confirm-button"
+                    :disabled="titleSaving"
+                    @click="saveTitle('viewport', batch.batchId, batch.note)"
+                  >
+                    {{ titleSaving ? '保存中…' : '确定' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="title-cancel-button"
+                    :disabled="titleSaving"
+                    @click="cancelTitleEdit"
+                  >
+                    取消
+                  </button>
+                </div>
+                <template v-else>
+                  <strong>{{ batch.note || '未填写备注' }}</strong>
+                  <button
+                    type="button"
+                    class="title-edit-button"
+                    aria-label="修改任务标题"
+                    @click="startTitleEdit('viewport', batch.batchId, batch.note)"
+                  >
+                    ✎ 修改
+                  </button>
+                </template>
               </div>
               <div class="batch-actions">
                 <button
@@ -450,7 +539,46 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
                         : '运行中'
                   }}
                 </span>
-                <strong>{{ agentRun.note || 'Agent 探索' }}</strong>
+                <div
+                  v-if="editingTitleKey === titleKey('agent', agentRun.runId)"
+                  class="title-editor"
+                >
+                  <el-input
+                    v-model="titleDraft"
+                    :maxlength="batchNoteMaxLength"
+                    :disabled="titleSaving"
+                    placeholder="请输入任务标题"
+                    @keyup.enter.prevent="saveTitle('agent', agentRun.runId, agentRun.note)"
+                    @keyup.esc.prevent="cancelTitleEdit"
+                  />
+                  <button
+                    type="button"
+                    class="title-confirm-button"
+                    :disabled="titleSaving"
+                    @click="saveTitle('agent', agentRun.runId, agentRun.note)"
+                  >
+                    {{ titleSaving ? '保存中…' : '确定' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="title-cancel-button"
+                    :disabled="titleSaving"
+                    @click="cancelTitleEdit"
+                  >
+                    取消
+                  </button>
+                </div>
+                <template v-else>
+                  <strong>{{ agentRun.note || 'Agent 探索' }}</strong>
+                  <button
+                    type="button"
+                    class="title-edit-button"
+                    aria-label="修改任务标题"
+                    @click="startTitleEdit('agent', agentRun.runId, agentRun.note)"
+                  >
+                    ✎ 修改
+                  </button>
+                </template>
               </div>
               <div class="batch-actions">
                 <button
@@ -876,6 +1004,49 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
   font-size: 15px;
 }
 
+.title-editor {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  gap: 7px;
+  min-width: min(460px, 52vw);
+}
+
+.title-editor :deep(.el-input) {
+  min-width: 180px;
+}
+
+.title-edit-button,
+.title-confirm-button,
+.title-cancel-button {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  background: #fff;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.title-edit-button {
+  border-color: transparent;
+  color: var(--color-primary-dark);
+  background: transparent;
+}
+
+.title-confirm-button {
+  color: #fff;
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+}
+
+.title-confirm-button:disabled,
+.title-cancel-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .status-badge {
   padding: 4px 8px;
   border-radius: 999px;
@@ -1093,6 +1264,15 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
 
   .batch-actions {
     justify-content: flex-end;
+  }
+
+  .title-editor {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .title-editor :deep(.el-input) {
+    width: 100%;
   }
 
   .compare-selects {

@@ -22,8 +22,14 @@ import type {
   ScreenshotDevicePresetSnapshot,
   UpdateAgentRerunListRequest,
   UpdateAgentRerunListResponse,
+  UpdateRunNoteRequest,
 } from '@viewport-lab/shared'
-import { captureDelayValues, screenshotLimits, screenshotPlatformIds } from '@viewport-lab/shared'
+import {
+  batchNoteMaxLength,
+  captureDelayValues,
+  screenshotLimits,
+  screenshotPlatformIds,
+} from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import type { FastifyInstance } from 'fastify'
 
@@ -37,6 +43,7 @@ import {
   readRetryRun,
   sanitizeDeviceDir,
   updateAgentRerunList,
+  updateAgentRunNote,
   writeRetryRun,
 } from './recorder.js'
 import { rerunAgentRunInPlace, startAgentRun } from './runner.js'
@@ -358,6 +365,21 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({ run })
     },
   )
+
+  app.patch<{
+    Params: { runId: string }
+    Body: unknown
+    Reply: GetAgentRunResponse | { error: string }
+  }>('/api/agent/runs/:runId', async (request, reply) => {
+    const body = request.body as Partial<UpdateRunNoteRequest> | null
+    if (typeof body?.note !== 'string' || body.note.trim().length > batchNoteMaxLength) {
+      return reply.code(400).send({ error: 'Invalid task title' })
+    }
+    const run = await updateAgentRunNote(request.params.runId, body.note.trim())
+    if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+    publishAgentEvent({ type: 'status', run })
+    return reply.send({ run })
+  })
 
   app.post<{ Body: unknown; Reply: CreateAgentRunResponse | { error: string } }>(
     '/api/agent/runs',

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { AgentRun, AgentRunStatus, DeviceAgentRun } from '@viewport-lab/shared'
+import { ElMessage } from 'element-plus'
 import { computed, ref, watch } from 'vue'
 
 const props = defineProps<{
@@ -7,7 +8,7 @@ const props = defineProps<{
   rerunListUpdatingDeviceId: string | null
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   view: [device: DeviceAgentRun]
   steps: [device: DeviceAgentRun]
   toggleRerunList: [device: DeviceAgentRun, included: boolean]
@@ -15,6 +16,26 @@ defineEmits<{
 
 const activePanels = ref<string[]>([])
 const terminalStatuses = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled'])
+type AgentDisplayStatus = 'waiting' | 'in-progress' | 'success' | 'failure'
+
+const displayStatusByRunStatus: Record<AgentRunStatus, AgentDisplayStatus> = {
+  queued: 'waiting',
+  launching: 'in-progress',
+  running: 'in-progress',
+  awaiting_gateway: 'in-progress',
+  executing: 'in-progress',
+  capturing: 'in-progress',
+  completed: 'success',
+  failed: 'failure',
+  cancelled: 'failure',
+}
+
+const displayStatusLabels: Record<AgentDisplayStatus, string> = {
+  waiting: '等待',
+  'in-progress': '进行中',
+  success: '成功',
+  failure: '失败',
+}
 
 const platforms = computed(() => {
   const seen = new Set<string>()
@@ -47,26 +68,39 @@ function isInRerunList(deviceId: string): boolean {
 
 function executionRole(deviceId: string): string {
   if (props.run.executionMode === 'per_device') return '独立 Agent'
-  return props.run.leaderDeviceId === deviceId ? 'Agent 主设备' : '复用执行'
+  if (props.run.leaderDeviceId === deviceId) return 'Agent 主设备'
+  return props.run.executionMode === 'leader_resize_capture' ? '切换视口截图' : '复用执行'
+}
+
+function hasStepHistory(device: DeviceAgentRun): boolean {
+  return props.run.leaderDeviceId === device.deviceId || device.steps.length > 0
+}
+
+function canViewSteps(device: DeviceAgentRun): boolean {
+  return (
+    props.run.executionMode !== 'leader_resize_capture' ||
+    props.run.leaderDeviceId === device.deviceId
+  )
+}
+
+function handleViewSteps(device: DeviceAgentRun): void {
+  if (!canViewSteps(device)) {
+    ElMessage.info('暂时不支持查看非主设备每一步截图')
+    return
+  }
+  emit('steps', device)
 }
 
 function failedStepCount(device: DeviceAgentRun): number {
   return device.steps.filter((step) => step.status === 'failed').length
 }
 
+function displayStatus(status: AgentRunStatus): AgentDisplayStatus {
+  return displayStatusByRunStatus[status]
+}
+
 function statusLabel(status: AgentRunStatus): string {
-  const labels: Partial<Record<AgentRunStatus, string>> = {
-    queued: '等待',
-    launching: '启动浏览器',
-    running: '运行中',
-    awaiting_gateway: '等待模型',
-    executing: '执行中',
-    capturing: '截图中',
-    completed: '完成',
-    failed: '失败',
-    cancelled: '已取消',
-  }
-  return labels[status] ?? status
+  return displayStatusLabels[displayStatus(status)]
 }
 
 function formatTime(value: string | null): string {
@@ -79,7 +113,7 @@ function formatTime(value: string | null): string {
     <div class="results-heading">
       <div>
         <h2>设备截图</h2>
-        <p>一台主设备负责 Agent 决策，其余设备同步复用工具调用</p>
+        <p>主设备完成 Agent 操作后，系统切换各逻辑视口保存最终截图</p>
       </div>
     </div>
 
@@ -109,12 +143,11 @@ function formatTime(value: string | null): string {
                 :alt="`${device.presetName} Agent 最终截图`"
                 loading="lazy"
               />
-              <span>查看大图</span>
             </button>
             <div
               v-else
               class="image-placeholder"
-              :class="{ failed: device.status === 'failed' }"
+              :class="{ failed: displayStatus(device.status) === 'failure' }"
               :style="{
                 aspectRatio: `${preset(device)?.viewport.width ?? 390} / ${preset(device)?.viewport.height ?? 844}`,
               }"
@@ -134,7 +167,7 @@ function formatTime(value: string | null): string {
                     {{ executionRole(device.deviceId) }}
                   </span>
                 </div>
-                <span class="status-badge" :class="device.status">
+                <span class="status-badge" :class="displayStatus(device.status)">
                   {{ statusLabel(device.status) }}
                 </span>
               </div>
@@ -146,11 +179,11 @@ function formatTime(value: string | null): string {
                     {{ preset(device)?.viewport.height ?? '—' }}
                   </dd>
                 </div>
-                <div>
+                <div v-if="hasStepHistory(device)">
                   <dt>运行步骤</dt>
                   <dd>{{ device.steps.length }} 步</dd>
                 </div>
-                <div v-if="failedStepCount(device) > 0">
+                <div v-if="hasStepHistory(device) && failedStepCount(device) > 0">
                   <dt>失败调用</dt>
                   <dd class="failed-count">{{ failedStepCount(device) }} 次</dd>
                 </div>
@@ -182,7 +215,16 @@ function formatTime(value: string | null): string {
                         : '加入重跑清单'
                   }}
                 </button>
-                <button type="button" class="steps-button" @click="$emit('steps', device)">
+                <button
+                  type="button"
+                  class="steps-button"
+                  :title="
+                    canViewSteps(device)
+                      ? '查看 Agent 每步运行'
+                      : '暂时不支持查看非主设备每一步截图'
+                  "
+                  @click="handleViewSteps(device)"
+                >
                   查看每步运行
                 </button>
               </div>
@@ -278,18 +320,6 @@ function formatTime(value: string | null): string {
   height: auto;
 }
 
-.image-button span {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  padding: 5px 8px;
-  border-radius: 7px;
-  color: #fff;
-  background: rgb(22 24 35 / 72%);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
 .image-placeholder {
   display: flex;
   align-items: center;
@@ -318,18 +348,23 @@ function formatTime(value: string | null): string {
 
 .title-row {
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
 }
 
 .title-row h3 {
   margin: 0;
+  overflow: hidden;
   color: var(--color-text-strong);
   font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .device-title {
   display: grid;
+  flex: 1 1 auto;
   gap: 5px;
   min-width: 0;
 }
@@ -345,19 +380,34 @@ function formatTime(value: string | null): string {
 }
 
 .status-badge {
-  padding: 3px 7px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 48px;
+  height: 24px;
+  padding: 0 8px;
   border-radius: 999px;
-  color: var(--color-primary-dark);
-  background: var(--color-primary-soft);
+  color: var(--color-text-muted);
+  background: var(--color-surface-subtle);
   font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
 }
 
-.status-badge.completed {
+.status-badge.in-progress {
+  color: var(--color-primary-dark);
+  background: var(--color-primary-soft);
+}
+
+.status-badge.success {
   color: var(--color-success);
   background: var(--color-success-soft);
 }
 
-.status-badge.failed {
+.status-badge.failure {
   color: var(--color-danger);
   background: var(--color-danger-soft);
 }

@@ -19,6 +19,7 @@ export function generateSpec(
     '',
     `test.use({`,
     `  viewport: { width: ${device.viewport.width}, height: ${device.viewport.height} },`,
+    `  screen: { width: ${device.viewport.width}, height: ${device.viewport.height} },`,
     `  deviceScaleFactor: ${device.deviceScaleFactor},`,
     `  isMobile: ${device.isMobile},`,
     `  hasTouch: ${device.hasTouch},`,
@@ -40,7 +41,7 @@ export function generateSpec(
       screenshotIndex++
       lines.push(
         `    await page.waitForTimeout(2000)`,
-        `    await page.screenshot({ path: 'screenshots/${String(screenshotIndex).padStart(2, '0')}.png' })`,
+        `    await page.screenshot({ path: 'screenshots/${String(screenshotIndex).padStart(2, '0')}.png', scale: 'device' })`,
       )
     }
   }

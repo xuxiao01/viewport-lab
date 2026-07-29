@@ -43,3 +43,26 @@ test('rejects malformed Agent device snapshots before creating a run', async () 
     await app.close()
   }
 })
+
+test('validates Agent task title updates before reading the run', async () => {
+  const app = Fastify()
+  await registerAgentRoutes(app)
+
+  try {
+    const invalid = await app.inject({
+      method: 'PATCH',
+      url: '/api/agent/runs/2026-07-29_10-00-00-000_deadbeef',
+      payload: { note: 'x'.repeat(201) },
+    })
+    assert.equal(invalid.statusCode, 400)
+
+    const missing = await app.inject({
+      method: 'PATCH',
+      url: '/api/agent/runs/2026-07-29_10-00-00-000_deadbeef',
+      payload: { note: '  新标题  ' },
+    })
+    assert.equal(missing.statusCode, 404)
+  } finally {
+    await app.close()
+  }
+})

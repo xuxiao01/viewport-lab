@@ -60,8 +60,11 @@ const agentViewerVisible = ref(false)
 const agentStepViewerVisible = ref(false)
 const selectedAgentDevice = ref<DeviceAgentRun | null>(null)
 const isAgentMode = computed(() => aiTaskDescription.value.trim().length > 0)
-const taskRunning = computed(
-  () => store.isRunning || agentStore.creating || agentStore.isRunning || agentStore.rerunning,
+const taskSubmitting = computed(() => store.creating || agentStore.creating)
+const selectedViewportRunning = computed(
+  () =>
+    selectedKind.value === 'viewport' &&
+    (store.selectedBatch?.status === 'queued' || store.selectedBatch?.status === 'running'),
 )
 
 watch(
@@ -107,7 +110,7 @@ const resultPlatforms = computed(() =>
 )
 
 async function startDetectionTask(): Promise<void> {
-  if (taskRunning.value) return
+  if (taskSubmitting.value) return
   if (isAgentMode.value) {
     if (!agentStore.gatewayStatus?.configured) {
       ElMessage.error(agentStore.gatewayStatus?.reason ?? 'AI 网关未配置')
@@ -164,8 +167,8 @@ function applyConfiguration(configuration: TestConfiguration): void {
 }
 
 async function executeConfiguration(configuration: TestConfiguration): Promise<void> {
-  if (taskRunning.value) {
-    ElMessage.error('当前已有检测任务正在运行')
+  if (taskSubmitting.value) {
+    ElMessage.error('正在提交检测任务，请稍候')
     return
   }
   if (configuration.kind === 'agent') {
@@ -278,6 +281,23 @@ async function deleteAgentRun(runId: string): Promise<void> {
     ElMessage.success('Agent 批次已删除')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '删除 Agent 批次失败')
+  }
+}
+
+async function updateTaskTitle(
+  kind: RunKind,
+  runId: string,
+  title: string,
+  settled: (success: boolean) => void,
+): Promise<void> {
+  try {
+    if (kind === 'agent') await agentStore.updateRunNote(runId, title)
+    else await store.updateBatchNote(runId, title)
+    settled(true)
+    ElMessage.success('任务标题已修改')
+  } catch (error) {
+    settled(false)
+    ElMessage.error(error instanceof Error ? error.message : '修改任务标题失败')
   }
 }
 
@@ -423,7 +443,7 @@ onMounted(async () => {
         :active-category="activeCategory"
         :selected-preset-ids="selectedPresetIds"
         :platforms="viewportPresets"
-        :running="taskRunning"
+        :running="taskSubmitting"
         @update:url="url = $event"
         @update:note="note = $event"
         @update:ai-task-description="aiTaskDescription = $event"
@@ -454,7 +474,7 @@ onMounted(async () => {
         :detail-loading="selectedKind === 'agent' ? agentStore.detailLoading : store.detailLoading"
         :error="store.historyError ?? agentStore.error"
         :retryable="store.canRetrySelectedBatch"
-        :running="store.isRunning"
+        :running="selectedViewportRunning"
         :agent-rerunning="agentStore.rerunning"
         :agent-rerun-list-updating-device-id="agentStore.rerunListUpdatingDeviceId"
         :saved-configuration-source-keys="configurationStore.savedSourceKeys"
@@ -469,6 +489,7 @@ onMounted(async () => {
         @rerun="rerunBatch"
         @rerun-agent="rerunAgentRun"
         @toggle-agent-rerun-list="toggleAgentRerunList"
+        @update-title="updateTaskTitle"
         @add-configuration="addConfiguration"
         @view="viewScreenshot"
         @retry="store.retryTask"

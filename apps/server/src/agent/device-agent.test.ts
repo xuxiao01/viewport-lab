@@ -1,24 +1,29 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import type { ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
+import type { DeviceAgentRun, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 
-import type { AgentCliBridge, CliResult } from './cli-bridge.js'
+import type { AgentCliBridge, AgentViewportOptions, CliResult } from './cli-bridge.js'
 import type { DeviceAgentArtifacts } from './device-agent.js'
 import { runSharedDeviceAgent } from './device-agent.js'
 import type { ActionResultReport, DeviceLlmClient, NextActionResult } from './llm-client.js'
 
-function device(selectionId: string, presetName: string): ScreenshotDevicePresetSnapshot {
+function device(
+  selectionId: string,
+  presetName: string,
+  width = 390,
+  height = 844,
+): ScreenshotDevicePresetSnapshot {
   return {
     selectionId,
     platformId: 'ios-phone',
     platformName: '苹果手机',
     presetId: selectionId,
     presetName,
-    viewport: { width: 390, height: 844 },
+    viewport: { width, height },
     deviceScaleFactor: 3,
     isMobile: true,
     hasTouch: true,
@@ -29,8 +34,8 @@ function device(selectionId: string, presetName: string): ScreenshotDevicePreset
 }
 
 class FakeLlmClient implements DeviceLlmClient {
-  nextActionCalls = 0
   readonly reports: ActionResultReport[] = []
+  nextActionCalls = 0
 
   constructor(private readonly actions: NextActionResult[]) {}
 
@@ -49,23 +54,36 @@ class FakeLlmClient implements DeviceLlmClient {
 }
 
 class FakeCliBridge implements AgentCliBridge {
-  readonly executeCalls: Array<{ session: string; command: string; args: string[] }> = []
+  openCalls: string[] = []
+  resizeCalls: Array<{ width: number; height: number }> = []
+  executeCalls: Array<{ session: string; command: string; args: string[] }> = []
+  callOrder: string[] = []
   snapshotCalls = 0
-  readonly snapshotOutputs: string[] = []
-  failFollowerCommand: string | null = null
-  failLeaderCommand: string | null = null
+  snapshotOutputs: string[] = []
+  failCommand: string | null = null
+  failScreenshotFor: string | null = null
   waitStatus: 'ready' | 'timed_out' = 'ready'
   throwOnReadiness = false
   throwOnScreenshot = false
   largeOutput = false
-  blockedFollower: { promise: Promise<void>; release: () => void } | null = null
 
-  async open(): Promise<CliResult> {
+  async open(session: string, options: AgentViewportOptions): Promise<CliResult> {
+    this.openCalls.push(session)
+    this.callOrder.push(`open:${options.width}x${options.height}@${options.deviceScaleFactor}`)
     return success('opened')
   }
 
-  async resize(): Promise<CliResult> {
+  async resize(_session: string, width: number, height: number): Promise<CliResult> {
+    this.resizeCalls.push({ width, height })
+    this.callOrder.push(`resize:${width}x${height}`)
     return success('resized')
+  }
+
+  async configureViewport(
+    session: string,
+    options: AgentViewportOptions,
+  ): Promise<CliResult> {
+    return this.resize(session, options.width, options.height)
   }
 
   async snapshot(): Promise<CliResult> {
@@ -75,6 +93,9 @@ class FakeCliBridge implements AgentCliBridge {
 
   async screenshot(_session: string, filename: string): Promise<CliResult> {
     if (this.throwOnScreenshot) throw new Error('screenshot unavailable')
+    if (this.failScreenshotFor && filename.includes(this.failScreenshotFor)) {
+      return { ok: false, output: '', error: 'final screenshot unavailable' }
+    }
     await writeFile(filename, 'image', 'utf8')
     return success(filename)
   }
@@ -112,16 +133,9 @@ class FakeCliBridge implements AgentCliBridge {
 
   async execute(session: string, command: string, args: string[]): Promise<CliResult> {
     this.executeCalls.push({ session, command, args: [...args] })
-    if (session.includes('follower') && this.blockedFollower) {
-      await this.blockedFollower.promise
-      this.blockedFollower = null
-    }
-    if (session.includes('follower') && command === this.failFollowerCommand) {
-      return { ok: false, output: '', error: 'target ref not found' }
-    }
-    if (session.includes('leader') && command === this.failLeaderCommand) {
+    this.callOrder.push(`${command}:${args.join(' ')}`)
+    if (command === this.failCommand)
       return { ok: false, output: '', error: 'leader action failed' }
-    }
     return success(this.largeOutput ? 'x'.repeat(5_001) : `${command} completed`)
   }
 
@@ -132,379 +146,213 @@ class FakeCliBridge implements AgentCliBridge {
   async closeAll(): Promise<void> {}
 }
 
-test('waits for every device before asking the single LLM for the next action', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备'), device('follower', '从设备')]
-    const artifacts = await createArtifacts(testDir, devices)
+test('runs the LLM once in the leader then resizes the same session for every final viewport', async () => {
+  await withArtifacts(async (root) => {
+    const devices = [device('leader', '主设备', 390, 844), device('follower', '从设备', 430, 932)]
     const bridge = new FakeCliBridge()
-    bridge.blockedFollower = deferred()
     const llm = new FakeLlmClient([action('click', ['f1e2']), done()])
-    let llmCreateCount = 0
+    const runs = await run(devices, root, bridge, llm)
 
-    const runPromise = runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '点击继续',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => {
-        llmCreateCount += 1
-        return llm
-      },
-    })
-
-    await waitFor(() => bridge.executeCalls.some((call) => call.session.includes('follower')))
-    assert.equal(llm.nextActionCalls, 1)
-    bridge.blockedFollower.release()
-
-    const runs = await runPromise
-    assert.equal(llmCreateCount, 1)
-    assert.equal(llm.nextActionCalls, 2)
+    assert.equal(bridge.openCalls.length, 1)
+    assert.equal(bridge.executeCalls.length, 2)
+    assert.deepEqual(bridge.callOrder.slice(0, 2), [
+      'open:390x844@3',
+      'goto:https://example.com',
+    ])
     assert.equal(llm.reports.length, 1)
+    assert.deepEqual(bridge.resizeCalls.slice(-2), [
+      { width: 390, height: 844 },
+      { width: 430, height: 932 },
+    ])
+    assert.equal(runs[0]?.steps.length, 2)
+    assert.equal(runs[1]?.steps.length, 0)
     assert.deepEqual(
-      bridge.executeCalls.map(({ command, args }) => ({ command, args })),
-      [
-        { command: 'click', args: ['f1e2'] },
-        { command: 'click', args: ['f1e2'] },
-      ],
-    )
-    assert.deepEqual(
-      runs.map((run) => run.status),
+      runs.map((item) => item.status),
       ['completed', 'completed'],
     )
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
+    assert.ok(runs.every((item) => item.finalScreenshotUrl))
+    assert.equal(runs[1]?.testScriptUrl, null)
+    assert.equal(runs[0]?.cliDeviceName, '')
+    const spec = await readFile(join(root, 'leader', 'agent.spec.ts'), 'utf8')
+    assert.match(spec, /viewport: \{ width: 390, height: 844 \}/)
+    assert.match(spec, /screen: \{ width: 390, height: 844 \}/)
+    assert.match(spec, /deviceScaleFactor: 3/)
+    assert.match(spec, /isMobile: true/)
+    assert.match(spec, /hasTouch: true/)
+  })
 })
 
-test('records a follower action failure and continues without reporting it to the LLM', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备'), device('follower', '从设备')]
-    const artifacts = await createArtifacts(testDir, devices)
+test('records post-action state even when the leader action fails', async () => {
+  await withArtifacts(async (root) => {
     const bridge = new FakeCliBridge()
-    bridge.failFollowerCommand = 'click'
-    const llm = new FakeLlmClient([action('click', ['f1e2']), action('press', ['Enter']), done()])
-    const followerErrors: string[] = []
-
-    const runs = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '继续并确认',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: ({ error }) => {
-        followerErrors.push(error)
-      },
-      createLlmClient: () => llm,
-    })
-
-    const followerRun = runs[1]!
-    assert.equal(followerRun.status, 'completed')
-    assert.deepEqual(
-      followerRun.steps.map((step) => step.status),
-      ['success', 'failed', 'success'],
-    )
-    assert.equal(followerRun.steps[1]?.output, 'target ref not found')
-    assert.deepEqual(followerErrors, ['target ref not found'])
-    assert.equal(llm.reports.length, 2)
-    assert.ok(llm.reports.every((report) => report.ok))
-    assert.equal(bridge.executeCalls.filter((call) => call.session.includes('follower')).length, 2)
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
-})
-
-test('captures post-action state even when the leader action fails or readiness times out', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备')]
-    const artifacts = await createArtifacts(testDir, devices)
-    const bridge = new FakeCliBridge()
-    bridge.failLeaderCommand = 'click'
+    bridge.failCommand = 'click'
     bridge.waitStatus = 'timed_out'
     bridge.snapshotOutputs.push('- main [ref=e1]', '- alert: action failed')
     const llm = new FakeLlmClient([action('click', ['f1e2']), done()])
+    const [deviceRun] = await run([device('leader', '主设备')], root, bridge, llm)
 
-    const [run] = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '点击继续',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
-    })
-
-    assert.equal(run?.steps[1]?.status, 'failed')
-    assert.equal(run?.steps[1]?.wait?.status, 'timed_out')
-    assert.equal(run?.steps[1]?.snapshot, '- alert: action failed')
-    assert.ok(run?.steps[1]?.screenshotUrl)
+    assert.equal(deviceRun?.steps[1]?.status, 'failed')
+    assert.equal(deviceRun?.steps[1]?.wait?.status, 'timed_out')
+    assert.equal(deviceRun?.steps[1]?.snapshot, '- alert: action failed')
     assert.equal(llm.reports[0]?.ok, false)
-    assert.equal(llm.reports[0]?.wait.status, 'timed_out')
-    assert.equal(bridge.snapshotCalls, 2)
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
+  })
 })
 
-test('deduplicates identical snapshots and caps changed model snapshots at 40000 characters', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备')]
-    const artifacts = await createArtifacts(testDir, devices)
+test('deduplicates snapshots and caps the model snapshot', async () => {
+  await withArtifacts(async (root) => {
     const bridge = new FakeCliBridge()
     const initial = '- main [ref=e1]'
-    const oversized = 'x'.repeat(40_001)
-    bridge.snapshotOutputs.push(initial, initial, oversized)
+    bridge.snapshotOutputs.push(initial, initial, 'x'.repeat(40_001))
     const llm = new FakeLlmClient([action('press', ['Tab']), action('press', ['Enter']), done()])
+    const [deviceRun] = await run([device('leader', '主设备')], root, bridge, llm)
 
-    const [run] = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '操作页面',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
-    })
-
-    assert.equal(run?.steps[1]?.snapshot, null)
-    assert.equal(run?.steps[1]?.snapshotMeta?.changed, false)
-    assert.equal(run?.steps[1]?.snapshotMeta?.sameAsStepIndex, 0)
-    assert.equal(run?.steps[2]?.snapshot?.length, 40_000)
-    assert.equal(run?.steps[2]?.snapshotMeta?.truncated, true)
-    assert.equal(run?.steps[2]?.snapshotMeta?.originalChars, 40_001)
-    assert.equal(llm.reports[0]?.snapshot, null)
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
+    assert.equal(deviceRun?.steps[1]?.snapshot, null)
+    assert.equal(deviceRun?.steps[1]?.snapshotMeta?.sameAsStepIndex, 0)
+    assert.equal(deviceRun?.steps[2]?.snapshot?.length, 40_000)
+    assert.equal(deviceRun?.steps[2]?.snapshotMeta?.truncated, true)
+  })
 })
 
-test('handles explicit snapshot through one automatic observation without executing snapshot command', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备')]
-    const artifacts = await createArtifacts(testDir, devices)
-    const bridge = new FakeCliBridge()
-    const llm = new FakeLlmClient([action('snapshot', []), done()])
-
-    const [run] = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '观察页面',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
-    })
-
-    assert.equal(bridge.executeCalls.length, 0)
-    assert.equal(bridge.snapshotCalls, 2)
-    assert.equal(run?.steps[1]?.output, 'Snapshot captured after page readiness.')
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
-})
-
-test('keeps the run alive when page observation and screenshot calls throw', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备')]
-    const artifacts = await createArtifacts(testDir, devices)
-    const bridge = new FakeCliBridge()
-    bridge.throwOnReadiness = true
-    bridge.throwOnScreenshot = true
-    const llm = new FakeLlmClient([action('click', ['f1e2']), done()])
-
-    const [run] = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '点击继续',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
-    })
-
-    assert.equal(run?.status, 'completed')
-    assert.equal(run?.steps[1]?.status, 'success')
-    assert.equal(run?.steps[1]?.wait?.reason, 'observer_error')
-    assert.equal(run?.steps[1]?.screenshotUrl, null)
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
-})
-
-test('marks the shared run incomplete when the leader reaches max turns', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备'), device('follower', '从设备')]
-    const artifacts = await createArtifacts(testDir, devices)
+test('does not capture any target when the leader cannot finish', async () => {
+  await withArtifacts(async (root) => {
+    const devices = [device('leader', '主设备'), device('follower', '从设备', 430, 932)]
     const bridge = new FakeCliBridge()
     const llm = new FakeLlmClient([action('click', ['f1e2'])])
-
-    const runs = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '点击继续',
-      maxTurns: 1,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
-    })
+    const runs = await run(devices, root, bridge, llm, { maxTurns: 1 })
 
     assert.deepEqual(
-      runs.map((run) => ({ status: run.status, error: run.error })),
-      [
-        { status: 'failed', error: 'Agent 达到最大轮数 1，未收到完成信号' },
-        { status: 'cancelled', error: '主设备 Agent 未完成，未继续执行' },
-      ],
+      runs.map((item) => item.status),
+      ['failed', 'failed'],
     )
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
+    assert.equal(runs[1]?.error, '主设备 Agent 未完成，未生成视口截图')
+    assert.equal(
+      bridge.resizeCalls.some((call) => call.width === 430 && call.height === 932),
+      false,
+    )
+  })
 })
 
-test('limits large action output before reporting it to the model', async () => {
-  const testDir = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
-  try {
-    const devices = [device('leader', '主设备')]
-    const artifacts = await createArtifacts(testDir, devices)
+test('only replaces selected viewport captures while preserving other device results', async () => {
+  await withArtifacts(async (root) => {
+    const devices = [device('leader', '主设备'), device('follower', '从设备', 430, 932)]
     const bridge = new FakeCliBridge()
-    bridge.largeOutput = true
-    const llm = new FakeLlmClient([action('eval', ['() => 1']), done()])
-
-    const [run] = await runSharedDeviceAgent({
-      devices,
-      artifacts,
-      url: 'https://example.com',
-      task: '读取页面状态',
-      maxTurns: 5,
-      runId: 'test-run',
-      gatewayConfig: null,
-      cliBridge: bridge,
-      screenshotDelayMs: 0,
-      onDeviceStatus: () => undefined,
-      onDeviceStep: () => undefined,
-      onFollowerError: () => undefined,
-      createLlmClient: () => llm,
+    const existing: DeviceAgentRun[] = [
+      makeExisting(devices[0]!, true),
+      makeExisting(devices[1]!, false),
+    ]
+    const llm = new FakeLlmClient([done()])
+    const runs = await run(devices, root, bridge, llm, {
+      captureDeviceIds: new Set(['follower']),
+      existingDeviceRuns: existing,
     })
 
-    assert.equal(run?.steps[1]?.output?.length, 4_000)
-    assert.equal(llm.reports[0]?.output.length, 4_000)
-  } finally {
-    await rm(testDir, { recursive: true, force: true })
-  }
+    assert.equal(runs[0]?.finalScreenshotUrl, '/old-leader.png')
+    assert.equal(runs[0]?.steps.length, 1)
+    assert.ok(runs[1]?.finalScreenshotUrl?.includes('follower.png'))
+    assert.equal(runs[1]?.steps.length, 0)
+  })
+})
+
+test('marks only the viewport whose final capture fails as failed', async () => {
+  await withArtifacts(async (root) => {
+    const devices = [device('leader', '主设备'), device('follower', '从设备')]
+    const bridge = new FakeCliBridge()
+    bridge.failScreenshotFor = 'follower.png'
+    const runs = await run(devices, root, bridge, new FakeLlmClient([done()]))
+    assert.deepEqual(
+      runs.map((item) => item.status),
+      ['completed', 'failed'],
+    )
+  })
 })
 
 function action(command: string, args: string[]): NextActionResult {
-  return {
-    command,
-    args,
-    purpose: `执行 ${command}`,
-    info: null,
-    done: false,
-    summary: null,
-  }
+  return { command, args, purpose: `执行 ${command}`, info: null, done: false, summary: null }
 }
 
 function done(): NextActionResult {
-  return {
-    command: null,
-    args: [],
-    purpose: '',
-    info: null,
-    done: true,
-    summary: null,
-  }
+  return { command: null, args: [], purpose: '', info: null, done: true, summary: null }
 }
 
 function success(output: string): CliResult {
   return { ok: true, output, error: null }
 }
 
-function deferred(): { promise: Promise<void>; release: () => void } {
-  let release: () => void = () => {}
-  const promise = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  return { promise, release }
+function makeExisting(device: ScreenshotDevicePresetSnapshot, leader: boolean): DeviceAgentRun {
+  return {
+    deviceId: device.selectionId,
+    platformId: device.platformId,
+    presetId: device.presetId,
+    presetName: device.presetName,
+    cliDeviceName: 'old-device',
+    status: 'completed',
+    steps: [],
+    finalScreenshotPath: leader
+      ? 'data/runs/test-run/leader.png'
+      : 'data/runs/test-run/follower.png',
+    finalScreenshotUrl: leader ? '/old-leader.png' : '/old-follower.png',
+    testScriptUrl: null,
+    error: null,
+    summary: null,
+    durationMs: 1,
+  }
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
+async function run(
+  devices: ScreenshotDevicePresetSnapshot[],
+  root: string,
+  bridge: FakeCliBridge,
+  llm: FakeLlmClient,
+  overrides: Partial<Parameters<typeof runSharedDeviceAgent>[0]> = {},
+): Promise<DeviceAgentRun[]> {
+  return runSharedDeviceAgent({
+    devices,
+    artifacts: await createArtifacts(root, devices),
+    url: 'https://example.com',
+    task: '测试任务',
+    maxTurns: 5,
+    runId: 'test-run',
+    gatewayConfig: null,
+    cliBridge: bridge,
+    screenshotDelayMs: 0,
+    onDeviceStatus: () => undefined,
+    onDeviceStep: () => undefined,
+    createLlmClient: () => llm,
+    ...overrides,
+  })
+}
+
+async function withArtifacts(runCase: (root: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'viewport-lab-agent-'))
+  try {
+    await runCase(root)
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
-  throw new Error('等待测试条件超时')
 }
 
 async function createArtifacts(
   root: string,
   devices: ScreenshotDevicePresetSnapshot[],
 ): Promise<Map<string, DeviceAgentArtifacts>> {
-  const entries = await Promise.all(
-    devices.map(async (item) => {
-      const deviceDir = join(root, item.selectionId)
-      const screenshotsDir = join(deviceDir, 'steps')
-      const snapshotsDir = join(deviceDir, 'snapshots')
-      await mkdir(screenshotsDir, { recursive: true })
-      await mkdir(snapshotsDir, { recursive: true })
-      return [
-        item.selectionId,
-        {
-          screenshotsDir,
-          snapshotsDir,
-          specDir: deviceDir,
-          finalScreenshotPath: join(root, `${item.selectionId}.png`),
-        },
-      ] as const
-    }),
+  return new Map(
+    await Promise.all(
+      devices.map(async (item) => {
+        const deviceDir = join(root, item.selectionId)
+        const screenshotsDir = join(deviceDir, 'steps')
+        const snapshotsDir = join(deviceDir, 'snapshots')
+        await mkdir(screenshotsDir, { recursive: true })
+        await mkdir(snapshotsDir, { recursive: true })
+        return [
+          item.selectionId,
+          {
+            screenshotsDir,
+            snapshotsDir,
+            specDir: deviceDir,
+            finalScreenshotPath: join(root, `${item.selectionId}.png`),
+          },
+        ] as const
+      }),
+    ),
   )
-  return new Map(entries)
 }

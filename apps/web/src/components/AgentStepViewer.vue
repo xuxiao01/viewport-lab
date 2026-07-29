@@ -21,11 +21,21 @@ const selectedStep = computed<DeviceAgentStep | null>(
     selectedDevice.value?.steps.find((step) => step.stepIndex === selectedStepIndex.value) ?? null,
 )
 
+const visibleDevices = computed(() => {
+  if (!props.run || props.run.executionMode !== 'leader_resize_capture') {
+    return props.run?.deviceRuns ?? []
+  }
+  return props.run.deviceRuns.filter((device) => device.deviceId === props.run?.leaderDeviceId)
+})
+
 watch(
   () => [props.modelValue, props.initialDeviceId, props.run?.runId] as const,
   () => {
     if (!props.modelValue || !props.run) return
-    selectedDeviceId.value = props.initialDeviceId ?? props.run.deviceRuns[0]?.deviceId ?? ''
+    const requestedDevice = visibleDevices.value.find(
+      (device) => device.deviceId === props.initialDeviceId,
+    )
+    selectedDeviceId.value = requestedDevice?.deviceId ?? visibleDevices.value[0]?.deviceId ?? ''
     selectedStepIndex.value = selectedDevice.value?.steps[0]?.stepIndex ?? 0
   },
   { immediate: true },
@@ -53,7 +63,8 @@ function formatDuration(value: number): string {
 
 function executionRole(deviceId: string): string {
   if (props.run?.executionMode === 'per_device') return '独立 Agent'
-  return props.run?.leaderDeviceId === deviceId ? 'Agent 主设备' : '复用执行'
+  if (props.run?.leaderDeviceId === deviceId) return 'Agent 主设备'
+  return props.run?.executionMode === 'leader_resize_capture' ? '切换视口截图' : '复用执行'
 }
 
 function waitLabel(status: 'ready' | 'timed_out'): string {
@@ -80,7 +91,7 @@ function snapshotLabel(step: DeviceAgentStep): string {
     <div v-if="run" class="step-viewer">
       <div class="device-tabs">
         <button
-          v-for="device in run.deviceRuns"
+          v-for="device in visibleDevices"
           :key="device.deviceId"
           type="button"
           :class="{ active: device.deviceId === selectedDeviceId }"

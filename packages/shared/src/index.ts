@@ -31,6 +31,10 @@ export type ScreenshotPlatformId = (typeof screenshotPlatformIds)[number]
 
 export const batchNoteMaxLength = 200
 
+export interface UpdateRunNoteRequest {
+  note: string
+}
+
 export const captureDelayValues = [0, 30_000] as const
 
 export type CaptureDelayMs = (typeof captureDelayValues)[number]

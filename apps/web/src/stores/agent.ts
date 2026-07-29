@@ -76,11 +76,11 @@ export const useAgentStore = defineStore('agent', () => {
   const rerunning = ref(false)
   const rerunListUpdatingDeviceId = ref<string | null>(null)
   const error = ref<string | null>(null)
-  const eventSource = ref<EventSource | null>(null)
-  let activeRerunDeviceIds: Set<string> | null = null
+  const eventSources = new Map<string, EventSource>()
+  const activeRerunDeviceIds = new Map<string, Set<string>>()
 
   const isRunning = computed(
-    () => currentRun.value !== null && !terminalStatuses.has(currentRun.value.status),
+    () => runHistory.value.some((run) => !terminalStatuses.has(run.status)),
   )
 
   const deviceRuns = computed<DeviceAgentRun[]>(() => currentRun.value?.deviceRuns ?? [])
@@ -121,6 +121,9 @@ export const useAgentStore = defineStore('agent', () => {
       const response = await fetch('/api/agent/runs')
       if (!response.ok) throw new Error(await readApiError(response, '无法加载 Agent 运行历史'))
       runHistory.value = ((await response.json()) as ListAgentRunsResponse).runs
+      for (const run of runHistory.value) {
+        if (!terminalStatuses.has(run.status)) watchRun(run.runId)
+      }
     } catch (err) {
       error.value = err instanceof Error ? err.message : '无法加载 Agent 运行历史'
     } finally {
@@ -129,15 +132,14 @@ export const useAgentStore = defineStore('agent', () => {
   }
 
   async function selectRun(runId: string): Promise<void> {
-    stopWatching()
-    activeRerunDeviceIds = null
     selectedRunId.value = runId
     detailLoading.value = true
     try {
       const response = await fetch(`/api/agent/runs/${runId}`)
       if (!response.ok) throw new Error(await readApiError(response, '无法加载 Agent 运行详情'))
-      currentRun.value = ((await response.json()) as GetAgentRunResponse).run
-      if (!terminalStatuses.has(currentRun.value.status)) watchRun(runId)
+      const run = ((await response.json()) as GetAgentRunResponse).run
+      applyRunUpdate(run)
+      if (!terminalStatuses.has(run.status)) watchRun(runId)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '无法加载 Agent 运行详情'
     } finally {
@@ -155,7 +157,8 @@ export const useAgentStore = defineStore('agent', () => {
 
   function mergeRunUpdate(incomingRun: AgentRun): AgentRun {
     const current = currentRun.value
-    if (!current || current.runId !== incomingRun.runId || activeRerunDeviceIds === null) {
+    const rerunDeviceIds = activeRerunDeviceIds.get(incomingRun.runId)
+    if (!current || current.runId !== incomingRun.runId || !rerunDeviceIds) {
       return incomingRun
     }
     const incomingDevices = new Map(
@@ -165,7 +168,7 @@ export const useAgentStore = defineStore('agent', () => {
       ...incomingRun,
       devices: current.devices,
       deviceRuns: current.deviceRuns.map((deviceRun) =>
-        activeRerunDeviceIds!.has(deviceRun.deviceId)
+        rerunDeviceIds.has(deviceRun.deviceId)
           ? (incomingDevices.get(deviceRun.deviceId) ?? deviceRun)
           : deviceRun,
       ),
@@ -173,17 +176,21 @@ export const useAgentStore = defineStore('agent', () => {
   }
 
   function applyRunUpdate(incomingRun: AgentRun): AgentRun {
-    const mergedRun = mergeRunUpdate(incomingRun)
-    currentRun.value = mergedRun
+    const isSelected = selectedRunId.value === incomingRun.runId
+    const mergedRun = isSelected ? mergeRunUpdate(incomingRun) : incomingRun
+    if (isSelected) currentRun.value = mergedRun
     upsertHistory(mergedRun)
-    if (terminalStatuses.has(mergedRun.status)) activeRerunDeviceIds = null
+    if (terminalStatuses.has(mergedRun.status)) {
+      activeRerunDeviceIds.delete(mergedRun.runId)
+      stopWatching(mergedRun.runId)
+    }
     return mergedRun
   }
 
   function watchRun(runId: string): void {
-    stopWatching()
+    if (eventSources.has(runId)) return
     const source = new EventSource(`/api/agent/runs/${runId}/events`)
-    eventSource.value = source
+    eventSources.set(runId, source)
 
     source.addEventListener('status', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
@@ -193,7 +200,11 @@ export const useAgentStore = defineStore('agent', () => {
     })
     source.addEventListener('device_status', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
-      if (event.type === 'device_status' && currentRun.value) {
+      if (
+        event.type === 'device_status' &&
+        currentRun.value?.runId === runId &&
+        selectedRunId.value === runId
+      ) {
         currentRun.value = {
           ...currentRun.value,
           deviceRuns: currentRun.value.deviceRuns.map((dr) =>
@@ -206,13 +217,13 @@ export const useAgentStore = defineStore('agent', () => {
     })
     source.addEventListener('device_step', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
-      if (event.type === 'device_step' && currentRun.value) {
+      if (event.type === 'device_step') {
         applyRunUpdate(event.run)
       }
     })
     source.addEventListener('device_completed', (message) => {
       const event = JSON.parse((message as MessageEvent<string>).data) as AgentEvent
-      if (event.type === 'device_completed' && currentRun.value) {
+      if (event.type === 'device_completed') {
         applyRunUpdate(event.run)
       }
     })
@@ -223,13 +234,18 @@ export const useAgentStore = defineStore('agent', () => {
       }
     })
     source.onerror = () => {
-      stopWatching()
+      stopWatching(runId)
     }
   }
 
-  function stopWatching(): void {
-    eventSource.value?.close()
-    eventSource.value = null
+  function stopWatching(runId?: string): void {
+    if (runId) {
+      eventSources.get(runId)?.close()
+      eventSources.delete(runId)
+      return
+    }
+    for (const source of eventSources.values()) source.close()
+    eventSources.clear()
   }
 
   async function submitRun(payload: CreateAgentRunRequest): Promise<AgentRun> {
@@ -240,7 +256,7 @@ export const useAgentStore = defineStore('agent', () => {
     })
     if (!response.ok) throw new Error(await readApiError(response, '创建 Agent 运行失败'))
     const run = ((await response.json()) as CreateAgentRunResponse).run
-    activeRerunDeviceIds = null
+    activeRerunDeviceIds.delete(run.runId)
     currentRun.value = run
     selectedRunId.value = run.runId
     upsertHistory(run)
@@ -319,13 +335,14 @@ export const useAgentStore = defineStore('agent', () => {
       })
       if (!response.ok) throw new Error(await readApiError(response, '重跑 Agent 批次失败'))
       const result = (await response.json()) as RerunAgentRunResponse
-      activeRerunDeviceIds = new Set(result.selectionIds)
+      activeRerunDeviceIds.set(runId, new Set(result.selectionIds))
+      selectedRunId.value = runId
       const run = applyRunUpdate(result.run)
       selectedRunId.value = run.runId
       watchRun(run.runId)
       return run
     } catch (err) {
-      activeRerunDeviceIds = null
+      activeRerunDeviceIds.delete(runId)
       error.value = err instanceof Error ? err.message : '重跑 Agent 批次失败'
       return null
     } finally {
@@ -360,13 +377,30 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  async function updateRunNote(runId: string, note: string): Promise<AgentRun> {
+    const response = await fetch(`/api/agent/runs/${runId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: note.trim() }),
+    })
+    if (!response.ok) throw new Error(await readApiError(response, '修改任务标题失败'))
+    const run = ((await response.json()) as GetAgentRunResponse).run
+    if (currentRun.value?.runId === runId) {
+      currentRun.value = { ...currentRun.value, note: run.note }
+    }
+    runHistory.value = runHistory.value.map((item) =>
+      item.runId === runId ? { ...item, note: run.note } : item,
+    )
+    return currentRun.value?.runId === runId ? currentRun.value : run
+  }
+
   async function deleteRun(runId: string): Promise<void> {
     const response = await fetch(`/api/agent/runs/${runId}`, { method: 'DELETE' })
     if (!response.ok) throw new Error(await readApiError(response, '删除 Agent 运行失败'))
+    stopWatching(runId)
+    activeRerunDeviceIds.delete(runId)
     runHistory.value = runHistory.value.filter((item) => item.runId !== runId)
     if (selectedRunId.value === runId) {
-      stopWatching()
-      activeRerunDeviceIds = null
       selectedRunId.value = null
       currentRun.value = null
     }
@@ -393,6 +427,7 @@ export const useAgentStore = defineStore('agent', () => {
     createRunFromSnapshots,
     rerunRun,
     updateRerunList,
+    updateRunNote,
     deleteRun,
     stopWatching,
   }

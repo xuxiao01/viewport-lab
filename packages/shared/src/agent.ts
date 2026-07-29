@@ -14,7 +14,11 @@ export const agentRunStatuses = [
 
 export type AgentRunStatus = (typeof agentRunStatuses)[number]
 
-export const agentExecutionModes = ['per_device', 'leader_broadcast'] as const
+export const agentExecutionModes = [
+  'per_device',
+  'leader_broadcast',
+  'leader_resize_capture',
+] as const
 
 export type AgentExecutionMode = (typeof agentExecutionModes)[number]
 

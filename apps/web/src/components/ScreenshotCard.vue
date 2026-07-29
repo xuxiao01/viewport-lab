@@ -50,7 +50,6 @@ function formatTime(value: string | null | undefined): string {
       @click="$emit('view', task)"
     >
       <img :src="task.run.screenshotUrl" :alt="`${task.preset.name} 截图`" loading="lazy" />
-      <span>查看大图</span>
     </button>
     <div
       v-else
@@ -136,24 +135,6 @@ function formatTime(value: string | null | undefined): string {
   display: block;
   width: 100%;
   height: auto;
-}
-
-.image-button span {
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  padding: 5px 8px;
-  border-radius: 7px;
-  color: #fff;
-  background: rgb(22 24 35 / 72%);
-  font-size: 11px;
-  line-height: 1.4;
-  opacity: 0;
-  transition: opacity 160ms ease;
-}
-
-.image-button:hover span {
-  opacity: 1;
 }
 
 .image-placeholder {

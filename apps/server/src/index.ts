@@ -28,14 +28,17 @@ import type {
   RunManifest,
   ScreenshotDevicePresetSnapshot,
   ScreenshotDeviceRun,
+  UpdateRunNoteRequest,
 } from '@viewport-lab/shared'
 import Fastify from 'fastify'
 import { chromium } from 'playwright'
 import type { Page } from 'playwright'
 
 import { registerAgent } from './agent/index.js'
+import { normalizeInterruptedAgentRuns } from './agent/recorder.js'
 import { registerFontCheck } from './font-check.js'
 import { archiveIdPattern, createArchiveId } from './run-archive.js'
+import { SerialBatchScheduler } from './task-scheduler.js'
 import { registerTestConfigurationRoutes } from './test-configurations.js'
 
 const rootDir = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
@@ -57,6 +60,7 @@ const batches = new Map<string, BatchManifest>()
 const batchWriteQueues = new Map<string, Promise<void>>()
 const batchUpdateQueues = new Map<string, Promise<void>>()
 const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
+const viewportBatchScheduler = new SerialBatchScheduler()
 const runIdPattern = /^[0-9a-f-]{36}$/i
 const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
 const selectionIdPattern = /^[a-z0-9][a-z0-9:-]{0,127}$/
@@ -424,27 +428,31 @@ async function updateBatchForRun(run: RunManifest): Promise<void> {
 }
 
 async function failUnregisteredDevices(batchId: string): Promise<void> {
-  await enqueueBatchUpdate(batchId, async () => {
-    const batch = await readBatch(batchId)
-    if (!batch || isTerminalBatchStatus(batch.status)) return
-    const failedAt = new Date().toISOString()
-    let changed = false
-    const devices = batch.devices.map<ScreenshotDeviceRun>((device) => {
-      if (device.runId) return device
-      changed = true
-      return {
-        ...device,
-        status: 'failed',
-        updatedAt: failedAt,
-        completedAt: failedAt,
-        error: '截图任务未能在限定时间内启动',
-      }
+  try {
+    await enqueueBatchUpdate(batchId, async () => {
+      const batch = await readBatch(batchId)
+      if (!batch || isTerminalBatchStatus(batch.status)) return
+      const failedAt = new Date().toISOString()
+      let changed = false
+      const devices = batch.devices.map<ScreenshotDeviceRun>((device) => {
+        if (device.runId) return device
+        changed = true
+        return {
+          ...device,
+          status: 'failed',
+          updatedAt: failedAt,
+          completedAt: failedAt,
+          error: '截图任务未能在限定时间内启动',
+        }
+      })
+      if (!changed) return
+      const updated = aggregateBatch({ ...batch, devices, completedAt: null }, failedAt)
+      batches.set(batchId, updated)
+      await persistBatch(updated)
     })
-    if (!changed) return
-    const updated = aggregateBatch({ ...batch, devices, completedAt: null }, failedAt)
-    batches.set(batchId, updated)
-    await persistBatch(updated)
-  })
+  } finally {
+    viewportBatchScheduler.seal(batchId)
+  }
 }
 
 function publish(run: RunManifest): void {
@@ -718,6 +726,7 @@ async function executeRun(runId: string): Promise<void> {
 
 await mkdir(runsDir, { recursive: true })
 await normalizeInterruptedBatches()
+await normalizeInterruptedAgentRuns()
 await app.register(fastifyStatic, { root: runsDir, prefix: '/outputs/' })
 await registerFontCheck(app)
 await registerAgent(app)
@@ -789,6 +798,32 @@ app.get<{
   const batch = await readBatch(request.params.batchId)
   if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
   return reply.send(batch)
+})
+
+app.patch<{
+  Params: { batchId: string }
+  Body: unknown
+  Reply: BatchManifest | ApiErrorResponse
+}>('/api/batches/:batchId', async (request, reply) => {
+  const body = request.body as Partial<UpdateRunNoteRequest> | null
+  if (typeof body?.note !== 'string' || body.note.trim().length > batchNoteMaxLength) {
+    return reply.code(400).send({ error: 'Invalid task title' })
+  }
+  const note = body.note.trim()
+  let updated: BatchManifest | null = null
+  await enqueueBatchUpdate(request.params.batchId, async () => {
+    const batch = await readBatch(request.params.batchId)
+    if (!batch) return
+    updated = {
+      ...batch,
+      note,
+      updatedAt: new Date().toISOString(),
+    }
+    batches.set(batch.batchId, updated)
+    await persistBatch(updated)
+  })
+  if (!updated) return reply.code(404).send({ error: 'Screenshot batch not found' })
+  return reply.send(updated)
 })
 
 app.post<{
@@ -892,6 +927,9 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
     if (device.runId && device.status !== 'failed') {
       return reply.code(409).send({ error: 'Screenshot device is already running or completed' })
     }
+    const expectedRunCount = batch.devices.filter(
+      (item) => item.status === 'queued' && item.runId === null,
+    ).length
 
     const createdAt = new Date()
     const runId = randomUUID()
@@ -909,8 +947,13 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
     }
     runs.set(runId, run)
     await updateBatchForRun(run)
-    void executeRun(runId).catch((error: unknown) => {
-      app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
+    viewportBatchScheduler.enqueue(parsed.batchId, expectedRunCount, async () => {
+      try {
+        await executeRun(runId)
+      } catch (error: unknown) {
+        app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
+        throw error
+      }
     })
     return reply.code(202).send({ run })
   },

@@ -56,6 +56,15 @@ export async function clearDeviceArtifacts(runId: string, deviceId: string): Pro
   ])
 }
 
+/** Clears only transient Agent evidence, preserving the root final screenshot. */
+export async function clearDeviceAgentArtifacts(runId: string, deviceId: string): Promise<void> {
+  if (!archiveIdPattern.test(runId)) throw new Error(`Invalid agent run id: ${runId}`)
+  await rm(resolve(agentRunsDir, runId, 'agent', sanitizeDeviceDir(deviceId)), {
+    recursive: true,
+    force: true,
+  })
+}
+
 export interface AgentRunPersisted {
   runDir: string
   eventsPath: string
@@ -73,6 +82,7 @@ export class AgentRunRecorder {
   run: AgentRun
   private readonly runDir: string
   private readonly eventsPath: string
+  private persistQueue = Promise.resolve()
 
   constructor(persisted: AgentRunPersisted, run: AgentRun) {
     this.run = run
@@ -81,11 +91,12 @@ export class AgentRunRecorder {
   }
 
   async persist(): Promise<void> {
-    await writeFile(
-      runManifestPath(this.run.runId),
-      `${JSON.stringify(this.run, null, 2)}\n`,
-      'utf8',
-    )
+    const snapshot = `${JSON.stringify(this.run, null, 2)}\n`
+    const next = this.persistQueue
+      .catch(() => undefined)
+      .then(() => writeFile(resolve(this.runDir, 'manifest.json'), snapshot, 'utf8'))
+    this.persistQueue = next
+    await next
   }
 
   async appendEvent(event: Record<string, unknown>): Promise<void> {
@@ -139,6 +150,31 @@ export class AgentRunRecorder {
   }
 }
 
+const activeAgentRecorders = new Map<string, AgentRunRecorder>()
+
+export function registerActiveAgentRecorder(recorder: AgentRunRecorder): void {
+  activeAgentRecorders.set(recorder.run.runId, recorder)
+}
+
+export function unregisterActiveAgentRecorder(runId: string, recorder: AgentRunRecorder): void {
+  if (activeAgentRecorders.get(runId) === recorder) activeAgentRecorders.delete(runId)
+}
+
+export async function updateAgentRunNote(runId: string, note: string): Promise<AgentRun | null> {
+  const activeRecorder = activeAgentRecorders.get(runId)
+  if (activeRecorder) {
+    activeRecorder.update({ note })
+    await activeRecorder.persist()
+    return activeRecorder.run
+  }
+  const run = await readAgentRun(runId)
+  if (!run) return null
+  const recorder = new AgentRunRecorder(await ensureRunDirs(runId), run)
+  recorder.update({ note })
+  await recorder.persist()
+  return recorder.run
+}
+
 export async function updateAgentRerunList(
   run: AgentRun,
   deviceId: string,
@@ -170,13 +206,17 @@ export async function readAgentRun(runId: string): Promise<AgentRun | null> {
 }
 
 export function normalizeAgentRun(run: AgentRun): AgentRun {
-  if (run.executionMode !== 'leader_broadcast' && run.executionMode !== 'per_device') {
+  if (
+    run.executionMode !== 'leader_broadcast' &&
+    run.executionMode !== 'leader_resize_capture' &&
+    run.executionMode !== 'per_device'
+  ) {
     run.executionMode = 'per_device'
   }
   const configuredDeviceIds = new Set(
     Array.isArray(run.devices) ? run.devices.map((device) => device.selectionId) : [],
   )
-  if (run.executionMode === 'leader_broadcast') {
+  if (run.executionMode === 'leader_broadcast' || run.executionMode === 'leader_resize_capture') {
     run.leaderDeviceId =
       typeof run.leaderDeviceId === 'string' && configuredDeviceIds.has(run.leaderDeviceId)
         ? run.leaderDeviceId
@@ -219,6 +259,36 @@ export async function listAgentRuns(): Promise<AgentRun[]> {
   return runs
     .filter((run): run is AgentRun => run !== null)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+}
+
+export async function normalizeInterruptedAgentRuns(): Promise<void> {
+  const interruptedAt = nowIso()
+  for (const run of await listAgentRuns()) {
+    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue
+    const recorder = new AgentRunRecorder(await ensureRunDirs(run.runId), {
+      ...run,
+      status: 'failed',
+      updatedAt: interruptedAt,
+      completedAt: interruptedAt,
+      error: 'Agent 服务已重启，任务未能完成',
+      durationMs: Math.max(
+        0,
+        new Date(interruptedAt).getTime() - new Date(run.createdAt).getTime(),
+      ),
+      deviceRuns: run.deviceRuns.map((deviceRun) =>
+        deviceRun.status === 'completed' ||
+        deviceRun.status === 'failed' ||
+        deviceRun.status === 'cancelled'
+          ? deviceRun
+          : {
+              ...deviceRun,
+              status: 'failed',
+              error: 'Agent 服务已重启，任务未能完成',
+            },
+      ),
+    })
+    await recorder.persist()
+  }
 }
 
 const retryIdPattern = /^[0-9a-f-]{36}$/i

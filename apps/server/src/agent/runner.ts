@@ -7,22 +7,28 @@ import type {
 } from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import { createArchiveId } from '../run-archive.js'
+import { ConcurrencyScheduler } from '../task-scheduler.js'
 import type { AgentCliBridge } from './cli-bridge.js'
 import { createCliBridge } from './cli-bridge.js'
 import { readAgentGatewayConfig } from './config.js'
 import type { AgentGatewayConfig } from './config.js'
 import { runSharedDeviceAgent } from './device-agent.js'
 import {
+  clearDeviceAgentArtifacts,
   clearDeviceArtifacts,
   ensureDeviceDirs,
   ensureRunDirs,
   AgentRunRecorder,
+  registerActiveAgentRecorder,
+  unregisterActiveAgentRecorder,
 } from './recorder.js'
 
 export type AgentEventSink = (event: AgentEvent) => void
 export type { AgentEvent } from '@viewport-lab/shared'
 
 const activeRerunIds = new Set<string>()
+const agentScheduler = new ConcurrencyScheduler(3)
+
 export async function startAgentRun(params: {
   url: string
   task: string
@@ -58,13 +64,13 @@ export async function startAgentRun(params: {
 
   const initialRun: AgentRun = {
     kind: 'agent',
-    executionMode: 'leader_broadcast',
+    executionMode: 'leader_resize_capture',
     leaderDeviceId: devices[0]!.selectionId,
     runId,
     createdAt,
     updatedAt: createdAt,
     completedAt: null,
-    status: 'running',
+    status: 'queued',
     url,
     task,
     note,
@@ -78,30 +84,39 @@ export async function startAgentRun(params: {
   }
 
   const recorder = new AgentRunRecorder(persisted, initialRun)
-  const cliBridge = createCliBridge()
 
   await recorder.persist()
+  registerActiveAgentRecorder(recorder)
   emit({ type: 'status', run: recorder.run })
 
-  void runAllDevices({
-    recorder,
-    devices,
-    url,
-    task,
-    maxTurns,
-    runId,
-    gatewayConfig,
-    cliBridge,
-    emit,
-  })
-    .catch((error: unknown) => {
+  agentScheduler.enqueue(async () => {
+    try {
+      const cliBridge = createCliBridge()
+      recorder.setStatus('running')
+      await recorder.persist()
+      emit({ type: 'status', run: recorder.run })
+      await runAllDevices({
+        recorder,
+        devices,
+        url,
+        task,
+        maxTurns,
+        runId,
+        gatewayConfig,
+        cliBridge,
+        emit,
+      })
+    } catch (error: unknown) {
       recorder.setStatus('failed', error instanceof Error ? error.message : 'Agent 运行异常')
       emit({ type: 'status', run: recorder.run })
-    })
-    .finally(async () => {
-      await cliBridge.closeAll()
-      await recorder.persist()
-    })
+    } finally {
+      try {
+        await recorder.persist()
+      } finally {
+        unregisterActiveAgentRecorder(runId, recorder)
+      }
+    }
+  })
 
   return recorder.run
 }
@@ -121,19 +136,28 @@ export async function rerunAgentRunInPlace(params: {
   }
 
   try {
-    await Promise.all(
-      selectedDevices.map((device) => clearDeviceArtifacts(sourceRun.runId, device.selectionId)),
-    )
+    await Promise.all([
+      ...selectedDevices.map((device) => clearDeviceArtifacts(sourceRun.runId, device.selectionId)),
+      ...(selectedIdsHas(sourceRun.leaderDeviceId, selectedDevices)
+        ? []
+        : sourceRun.leaderDeviceId
+          ? [clearDeviceAgentArtifacts(sourceRun.runId, sourceRun.leaderDeviceId)]
+          : []),
+    ])
     const selectedIds = new Set(selectedDevices.map((device) => device.selectionId))
+    const leaderDevice =
+      sourceRun.devices.find((device) => device.selectionId === sourceRun.leaderDeviceId) ??
+      sourceRun.devices[0]!
+    const updatedIds = new Set([...selectedIds, leaderDevice.selectionId])
     const rerunAt = new Date().toISOString()
     const gatewayConfig = readAgentGatewayConfig()
     const initialRun: AgentRun = {
       ...sourceRun,
-      executionMode: 'leader_broadcast',
-      leaderDeviceId: selectedDevices[0]!.selectionId,
+      executionMode: 'leader_resize_capture',
+      leaderDeviceId: leaderDevice.selectionId,
       updatedAt: rerunAt,
       completedAt: null,
-      status: 'running',
+      status: 'queued',
       model: gatewayConfig?.model ?? sourceRun.model,
       deviceRuns: sourceRun.deviceRuns.map((deviceRun) =>
         selectedIds.has(deviceRun.deviceId)
@@ -149,45 +173,64 @@ export async function rerunAgentRunInPlace(params: {
               summary: null,
               durationMs: null,
             }
-          : deviceRun,
+          : deviceRun.deviceId === leaderDevice.selectionId
+            ? {
+                ...deviceRun,
+                cliDeviceName: '',
+                steps: [],
+                testScriptUrl: null,
+                summary: null,
+                error: null,
+                durationMs: null,
+              }
+            : deviceRun,
       ),
       error: null,
       durationMs: null,
     }
     const persisted = await ensureRunDirs(sourceRun.runId)
     const recorder = new AgentRunRecorder(persisted, initialRun)
-    const cliBridge = createCliBridge()
 
     await recorder.persist()
+    registerActiveAgentRecorder(recorder)
     emit({ type: 'status', run: recorder.run })
 
-    void runAllDevices({
-      recorder,
-      devices: selectedDevices,
-      url: sourceRun.url,
-      task: sourceRun.task,
-      maxTurns: sourceRun.maxTurns,
-      runId: sourceRun.runId,
-      gatewayConfig,
-      cliBridge,
-      emit,
-    })
-      .catch((error: unknown) => {
+    agentScheduler.enqueue(async () => {
+      try {
+        const cliBridge = createCliBridge()
+        recorder.setStatus('running')
+        await recorder.persist()
+        emit({ type: 'status', run: recorder.run })
+        await runAllDevices({
+          recorder,
+          devices: sourceRun.devices,
+          captureDeviceIds: selectedIds,
+          leaderDeviceId: leaderDevice.selectionId,
+          existingDeviceRuns: initialRun.deviceRuns,
+          url: sourceRun.url,
+          task: sourceRun.task,
+          maxTurns: sourceRun.maxTurns,
+          runId: sourceRun.runId,
+          gatewayConfig,
+          cliBridge,
+          emit,
+        })
+      } catch (error: unknown) {
         recorder.setStatus('failed', error instanceof Error ? error.message : 'Agent 运行异常')
         emit({ type: 'status', run: recorder.run })
-      })
-      .finally(async () => {
+      } finally {
         try {
-          await cliBridge.closeAll()
           await recorder.persist()
         } finally {
+          unregisterActiveAgentRecorder(sourceRun.runId, recorder)
           activeRerunIds.delete(sourceRun.runId)
         }
-      })
+      }
+    })
 
     return {
       run: recorder.run,
-      selectionIds: selectedDevices.map((device) => device.selectionId),
+      selectionIds: [...updatedIds],
     }
   } catch (error) {
     activeRerunIds.delete(sourceRun.runId)
@@ -209,9 +252,19 @@ export function selectRerunDevices(
   })
 }
 
+function selectedIdsHas(
+  deviceId: string | null,
+  devices: ScreenshotDevicePresetSnapshot[],
+): boolean {
+  return deviceId !== null && devices.some((device) => device.selectionId === deviceId)
+}
+
 async function runAllDevices(params: {
   recorder: AgentRunRecorder
   devices: ScreenshotDevicePresetSnapshot[]
+  captureDeviceIds?: ReadonlySet<string>
+  leaderDeviceId?: string
+  existingDeviceRuns?: DeviceAgentRun[]
   url: string
   task: string
   maxTurns: number
@@ -240,6 +293,9 @@ async function runAllDevices(params: {
 
   const deviceRuns = await runSharedDeviceAgent({
     devices,
+    ...(params.captureDeviceIds ? { captureDeviceIds: params.captureDeviceIds } : {}),
+    ...(params.leaderDeviceId ? { leaderDeviceId: params.leaderDeviceId } : {}),
+    ...(params.existingDeviceRuns ? { existingDeviceRuns: params.existingDeviceRuns } : {}),
     artifacts,
     url,
     task,
@@ -257,19 +313,6 @@ async function runAllDevices(params: {
       recorder.appendDeviceStep(deviceId, step)
       queuePersist()
       emit({ type: 'device_step', runId, deviceId, step, run: recorder.run })
-    },
-    onFollowerError: async ({ deviceId, stepIndex, command, error }) => {
-      const message = `从设备 ${deviceId} 第 ${stepIndex} 步 ${command} 执行失败，已跳过：${error}`
-      await recorder.appendEvent({
-        type: 'follower_action_failed',
-        level: 'warn',
-        runId,
-        deviceId,
-        stepIndex,
-        command,
-        error,
-      })
-      emit({ type: 'log', runId, message, level: 'warn' })
     },
   })
 
