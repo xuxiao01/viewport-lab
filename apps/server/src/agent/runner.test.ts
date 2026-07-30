@@ -4,17 +4,23 @@ import test from 'node:test'
 import type { AgentRun, DeviceAgentRun, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 
 import { normalizeAgentRun } from './recorder.js'
-import { selectRerunDevices } from './runner.js'
+import { AGENT_DEVICE_CONCURRENCY, selectRerunDevices } from './runner.js'
+
+test('limits the global Agent device pool to five independent Agents', () => {
+  assert.equal(AGENT_DEVICE_CONCURRENCY, 5)
+})
 
 test('normalizes legacy manifests as independent per-device Agent runs', () => {
   const run = makeRun()
   delete (run as Partial<AgentRun>).executionMode
   delete (run as Partial<AgentRun>).leaderDeviceId
+  delete (run as Partial<AgentRun>).rerunAt
 
   const normalized = normalizeAgentRun(run)
 
   assert.equal(normalized.executionMode, 'per_device')
   assert.equal(normalized.leaderDeviceId, null)
+  assert.equal(normalized.rerunAt, null)
 })
 
 test('normalizes missing page observation fields in legacy steps', () => {
@@ -53,6 +59,16 @@ test('keeps the single-agent resize execution mode and its configured leader', (
   assert.equal(normalized.leaderDeviceId, 'device-a')
 })
 
+test('keeps the independent context replay mode and its configured leader', () => {
+  const run = makeRun()
+  run.executionMode = 'leader_context_replay'
+
+  const normalized = normalizeAgentRun(run)
+
+  assert.equal(normalized.executionMode, 'leader_context_replay')
+  assert.equal(normalized.leaderDeviceId, 'device-a')
+})
+
 test('keeps rerun device ordering while retaining the original leader separately', () => {
   const run = makeRun()
   run.rerunDeviceIds = ['device-c', 'device-b']
@@ -77,6 +93,7 @@ function makeRun(): AgentRun {
     runId: 'test-run',
     createdAt: '2026-07-28T00:00:00.000Z',
     updatedAt: '2026-07-28T00:00:00.000Z',
+    rerunAt: null,
     completedAt: '2026-07-28T00:01:00.000Z',
     status: 'completed',
     url: 'https://example.com',
@@ -118,6 +135,9 @@ function makeDeviceRun(device: ScreenshotDevicePresetSnapshot): DeviceAgentRun {
     cliDeviceName: '',
     status: 'completed',
     steps: [],
+    replaySteps: [],
+    viewportMetrics: null,
+    screenshotPixelSize: null,
     finalScreenshotPath: null,
     finalScreenshotUrl: null,
     testScriptUrl: null,

@@ -18,6 +18,7 @@ export const agentExecutionModes = [
   'per_device',
   'leader_broadcast',
   'leader_resize_capture',
+  'leader_context_replay',
 ] as const
 
 export type AgentExecutionMode = (typeof agentExecutionModes)[number]
@@ -86,6 +87,69 @@ export interface AgentSnapshotMeta {
   sha256: string | null
 }
 
+export const agentReplayLocatorMethods = [
+  'locator',
+  'getByRole',
+  'getByText',
+  'getByLabel',
+  'getByPlaceholder',
+  'getByTestId',
+  'getByAltText',
+  'getByTitle',
+  'frameLocator',
+  'filter',
+  'first',
+  'last',
+  'nth',
+] as const
+
+export type AgentReplayLocatorMethod = (typeof agentReplayLocatorMethods)[number]
+export type AgentReplayLocatorValue =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: AgentReplayLocatorValue }
+
+export interface AgentReplayLocatorCall {
+  method: AgentReplayLocatorMethod
+  args: AgentReplayLocatorValue[]
+}
+
+export interface AgentReplayLocator {
+  calls: AgentReplayLocatorCall[]
+}
+
+export interface AgentReplayStep {
+  stepIndex: number
+  command: string
+  purpose: string
+  status: AgentStepStatus
+  durationMs: number
+  error: string | null
+  wait: AgentWaitResult | null
+  page: AgentPageState | null
+}
+
+export interface AgentViewportMetrics {
+  innerWidth: number
+  innerHeight: number
+  screenWidth: number
+  screenHeight: number
+  devicePixelRatio: number
+  maxTouchPoints: number
+  pointerCoarse: boolean
+  visualViewportWidth: number | null
+  visualViewportHeight: number | null
+  visualViewportScale: number | null
+  viewportMetaWidth: number | null
+}
+
+export interface AgentScreenshotPixelSize {
+  width: number
+  height: number
+}
+
 export interface DeviceAgentStep {
   stepIndex: number
   command: string
@@ -101,6 +165,7 @@ export interface DeviceAgentStep {
   snapshotMeta: AgentSnapshotMeta | null
   screenshotUrl: string | null
   locator: string | null
+  replayLocator: AgentReplayLocator | null
   startedAt: string
   completedAt: string
   durationMs: number
@@ -114,6 +179,9 @@ export interface DeviceAgentRun {
   cliDeviceName: string
   status: AgentRunStatus
   steps: DeviceAgentStep[]
+  replaySteps: AgentReplayStep[]
+  viewportMetrics: AgentViewportMetrics | null
+  screenshotPixelSize: AgentScreenshotPixelSize | null
   finalScreenshotPath: string | null
   finalScreenshotUrl: string | null
   testScriptUrl: string | null
@@ -129,6 +197,7 @@ export interface AgentRun {
   runId: string
   createdAt: string
   updatedAt: string
+  rerunAt: string | null
   completedAt: string | null
   status: AgentRunStatus
   url: string

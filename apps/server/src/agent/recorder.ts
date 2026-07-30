@@ -206,9 +206,11 @@ export async function readAgentRun(runId: string): Promise<AgentRun | null> {
 }
 
 export function normalizeAgentRun(run: AgentRun): AgentRun {
+  run.rerunAt = typeof run.rerunAt === 'string' ? run.rerunAt : null
   if (
     run.executionMode !== 'leader_broadcast' &&
     run.executionMode !== 'leader_resize_capture' &&
+    run.executionMode !== 'leader_context_replay' &&
     run.executionMode !== 'per_device'
   ) {
     run.executionMode = 'per_device'
@@ -216,7 +218,11 @@ export function normalizeAgentRun(run: AgentRun): AgentRun {
   const configuredDeviceIds = new Set(
     Array.isArray(run.devices) ? run.devices.map((device) => device.selectionId) : [],
   )
-  if (run.executionMode === 'leader_broadcast' || run.executionMode === 'leader_resize_capture') {
+  if (
+    run.executionMode === 'leader_broadcast' ||
+    run.executionMode === 'leader_resize_capture' ||
+    run.executionMode === 'leader_context_replay'
+  ) {
     run.leaderDeviceId =
       typeof run.leaderDeviceId === 'string' && configuredDeviceIds.has(run.leaderDeviceId)
         ? run.leaderDeviceId
@@ -233,7 +239,16 @@ export function normalizeAgentRun(run: AgentRun): AgentRun {
       wait: step.wait ?? null,
       page: step.page ?? null,
       snapshotMeta: step.snapshotMeta ?? null,
+      replayLocator: step.replayLocator ?? null,
     })),
+    replaySteps: Array.isArray(deviceRun.replaySteps) ? deviceRun.replaySteps : [],
+    viewportMetrics: deviceRun.viewportMetrics
+      ? {
+          ...deviceRun.viewportMetrics,
+          viewportMetaWidth: deviceRun.viewportMetrics.viewportMetaWidth ?? null,
+        }
+      : null,
+    screenshotPixelSize: deviceRun.screenshotPixelSize ?? null,
   }))
   run.rerunDeviceIds = Array.isArray(run.rerunDeviceIds)
     ? run.rerunDeviceIds.filter(

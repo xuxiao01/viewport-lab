@@ -22,7 +22,10 @@ const selectedStep = computed<DeviceAgentStep | null>(
 )
 
 const visibleDevices = computed(() => {
-  if (!props.run || props.run.executionMode !== 'leader_resize_capture') {
+  if (
+    !props.run ||
+    !['leader_resize_capture', 'leader_context_replay'].includes(props.run.executionMode)
+  ) {
     return props.run?.deviceRuns ?? []
   }
   return props.run.deviceRuns.filter((device) => device.deviceId === props.run?.leaderDeviceId)
@@ -64,6 +67,7 @@ function formatDuration(value: number): string {
 function executionRole(deviceId: string): string {
   if (props.run?.executionMode === 'per_device') return '独立 Agent'
   if (props.run?.leaderDeviceId === deviceId) return 'Agent 主设备'
+  if (props.run?.executionMode === 'leader_context_replay') return '独立视口重放'
   return props.run?.executionMode === 'leader_resize_capture' ? '切换视口截图' : '复用执行'
 }
 

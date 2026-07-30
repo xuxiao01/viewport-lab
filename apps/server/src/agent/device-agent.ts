@@ -2,19 +2,19 @@ import type {
   AgentPageState,
   AgentRunStatus,
   AgentSnapshotMeta,
-  AgentStepInfo,
   AgentWaitResult,
+  AgentViewportMetrics,
   DeviceAgentRun,
   DeviceAgentStep,
   ScreenshotDevicePresetSnapshot,
 } from '@viewport-lab/shared'
 import { createHash } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 
 import type { AgentCliBridge, CliResult } from './cli-bridge.js'
 import { sanitizeSessionId } from './cli-bridge.js'
 import type { AgentGatewayConfig } from './config.js'
-import type { ActionResultReport, NextActionResult } from './llm-client.js'
+import type { ActionResultReport, DeviceLlmClient, NextActionResult } from './llm-client.js'
 import { createDeviceLlmClient } from './llm-client.js'
 import { preparePageObservation, waitForPageReady } from './page-readiness.js'
 import { sanitizeDeviceDir } from './recorder.js'
@@ -23,6 +23,8 @@ import { generateSpec } from './test-script-generator.js'
 
 const SNAPSHOT_MODEL_LIMIT = 40_000
 const ACTION_OUTPUT_MODEL_LIMIT = 4_000
+const GATEWAY_RETRY_LIMIT = 3
+const GATEWAY_RETRY_BASE_DELAY_MS = 1_000
 
 function snapshotFilePath(dir: string, stepIndex: number): string {
   return `${dir}/${String(stepIndex).padStart(2, '0')}.txt`
@@ -35,12 +37,9 @@ export interface DeviceAgentArtifacts {
   finalScreenshotPath: string
 }
 
-export interface SharedDeviceAgentDeps {
-  devices: ScreenshotDevicePresetSnapshot[]
-  captureDeviceIds?: ReadonlySet<string>
-  leaderDeviceId?: string
-  existingDeviceRuns?: DeviceAgentRun[]
-  artifacts: Map<string, DeviceAgentArtifacts>
+export interface DeviceAgentDeps {
+  device: ScreenshotDevicePresetSnapshot
+  artifacts: DeviceAgentArtifacts
   url: string
   task: string
   maxTurns: number
@@ -51,6 +50,8 @@ export interface SharedDeviceAgentDeps {
   onDeviceStep: (deviceId: string, step: DeviceAgentStep) => void
   createLlmClient?: typeof createDeviceLlmClient
   screenshotDelayMs?: number
+  gatewayRetryDelayMs?: number
+  isCancelled?: () => boolean
 }
 
 interface DeviceRuntime {
@@ -73,145 +74,109 @@ interface PageObservation {
 }
 
 /**
- * Runs the LLM-driven flow once in the leader browser, then resizes that same
- * browser to capture the requested logical viewports. Generated specs remain
- * an archive of the leader flow and are never used to produce follower images.
+ * Runs one complete LLM-driven Agent in one device-specific BrowserContext.
+ * No page, model conversation, locator or browser state is shared with another device.
  */
-export async function runSharedDeviceAgent(deps: SharedDeviceAgentDeps): Promise<DeviceAgentRun[]> {
-  const leader = findLeader(deps.devices, deps.leaderDeviceId)
-  if (!leader) throw new Error('共享 Agent 至少需要一个设备')
-
-  const captureIds =
-    deps.captureDeviceIds ?? new Set(deps.devices.map((device) => device.selectionId))
-  const existingById = new Map(
-    (deps.existingDeviceRuns ?? []).map((deviceRun) => [deviceRun.deviceId, deviceRun]),
-  )
-  const runs = new Map<string, DeviceAgentRun>()
-  for (const device of deps.devices) {
-    const existing = existingById.get(device.selectionId)
-    const shouldReset = captureIds.has(device.selectionId)
-    runs.set(device.selectionId, createDeviceRun(device, shouldReset ? undefined : existing))
-  }
-
-  const leaderArtifacts = deps.artifacts.get(leader.selectionId)
-  if (!leaderArtifacts) throw new Error(`主设备 ${leader.selectionId} 缺少运行目录`)
-  const leaderRuntime = createLeaderRuntime(
-    deps,
-    leader,
-    leaderArtifacts,
-    runs.get(leader.selectionId)!,
-  )
-  runs.set(leader.selectionId, leaderRuntime.deviceRun)
-  let leaderSucceeded = false
-  let leaderSummary: AgentStepInfo | null = null
-  let leaderError: string | null = null
+export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgentRun> {
+  const runtime = createRuntime(deps)
+  let failure: string | null = null
+  let completedByModel = false
 
   try {
-    leaderError = await launchLeader(deps, leaderRuntime)
-    if (!leaderError) {
-      const initialSnapshot = leaderRuntime.deviceRun.steps[0]?.snapshot ?? '(snapshot unavailable)'
+    if (deps.isCancelled?.()) {
+      setStatus(deps, runtime.deviceRun, 'cancelled', '任务已取消')
+      return runtime.deviceRun
+    }
+    failure = await launchDevice(deps, runtime)
+    if (!failure) {
+      const initialSnapshot = runtime.deviceRun.steps[0]?.snapshot ?? '(snapshot unavailable)'
       const createLlmClient = deps.createLlmClient ?? createDeviceLlmClient
-      const llm = createLlmClient(deps.gatewayConfig, leader, deps.url, initialSnapshot, deps.task)
+      const llm = createLlmClient(
+        deps.gatewayConfig,
+        deps.device,
+        deps.url,
+        initialSnapshot,
+        deps.task,
+      )
       try {
         for (let turn = 1; turn <= deps.maxTurns; turn++) {
-          setStatus(deps, leaderRuntime.deviceRun, 'awaiting_gateway', null)
-          const next = await nextAction(llm)
+          if (deps.isCancelled?.()) break
+          setStatus(deps, runtime.deviceRun, 'awaiting_gateway', null)
+          const next = await nextActionWithRetry(deps, llm)
+          if (deps.isCancelled?.()) break
           if ('error' in next) {
-            leaderError = next.error
+            failure = next.error
             break
           }
           if (next.value.done) {
-            leaderSummary = next.value.summary
-            leaderSucceeded = true
+            runtime.deviceRun.summary = next.value.summary
+            completedByModel = true
             break
           }
           if (!next.value.command) {
-            leaderError = 'LLM 未返回命令且未声明完成'
+            failure = 'LLM 未返回命令且未声明完成'
             break
           }
-          const report = await executeLeaderAction(deps, leaderRuntime, turn, next.value)
+          const report = await executeDeviceAction(deps, runtime, turn, next.value)
           llm.reportResult(report)
         }
       } finally {
         llm.close()
       }
-      if (!leaderSucceeded && !leaderError) {
-        leaderError = `Agent 达到最大轮数 ${deps.maxTurns}，未收到完成信号`
+      if (!completedByModel && !failure && !deps.isCancelled?.()) {
+        failure = `Agent 达到最大轮数 ${deps.maxTurns}，未收到完成信号`
       }
     }
 
-    if (leaderError) {
-      failLeaderAndTargets(deps, leaderRuntime, runs, captureIds, leaderError)
-    } else {
-      leaderRuntime.deviceRun.summary = leaderSummary
-      await writeLeaderSpec(deps, leaderRuntime)
-      setStatus(deps, leaderRuntime.deviceRun, 'completed', null)
-      for (const device of deps.devices) {
-        if (!captureIds.has(device.selectionId)) continue
-        const deviceRun = runs.get(device.selectionId)!
-        await captureViewport(deps, leaderRuntime, device, deviceRun)
-      }
+    if (!deps.isCancelled?.()) {
+      await writeDeviceSpec(deps, runtime)
+      const captureError = await captureFinalScreenshot(deps, runtime)
+      if (!failure && captureError) failure = captureError
+    }
+  } catch (error) {
+    failure = errorMessage(error)
+    if (!deps.isCancelled?.() && !runtime.deviceRun.finalScreenshotUrl) {
+      await captureFinalScreenshot(deps, runtime).catch(() => undefined)
     }
   } finally {
+    runtime.deviceRun.durationMs = Date.now() - runtime.startedAt
     try {
-      await deps.cliBridge.close(leaderRuntime.session)
+      await deps.cliBridge.close(runtime.session)
     } catch {
-      // Session cleanup is best-effort.
+      // A device session is isolated; cleanup failure must not affect other devices.
     }
   }
 
-  return deps.devices.map((device) => runs.get(device.selectionId)!)
+  if (deps.isCancelled?.()) setStatus(deps, runtime.deviceRun, 'cancelled', '任务已取消')
+  else if (failure) setStatus(deps, runtime.deviceRun, 'failed', failure)
+  else setStatus(deps, runtime.deviceRun, 'completed', null)
+  return runtime.deviceRun
 }
 
-function findLeader(
-  devices: ScreenshotDevicePresetSnapshot[],
-  leaderDeviceId?: string,
-): ScreenshotDevicePresetSnapshot | null {
-  return devices.find((device) => device.selectionId === leaderDeviceId) ?? devices[0] ?? null
-}
-
-function createDeviceRun(
-  device: ScreenshotDevicePresetSnapshot,
-  existing?: DeviceAgentRun,
-): DeviceAgentRun {
-  if (existing) return { ...existing, steps: [...existing.steps] }
-  return {
-    deviceId: device.selectionId,
-    platformId: device.platformId,
-    presetId: device.presetId,
-    presetName: device.presetName,
-    cliDeviceName: '',
-    status: 'queued',
-    steps: [],
-    finalScreenshotPath: null,
-    finalScreenshotUrl: null,
-    testScriptUrl: null,
-    error: null,
-    summary: null,
-    durationMs: null,
-  }
-}
-
-function createLeaderRuntime(
-  deps: SharedDeviceAgentDeps,
-  device: ScreenshotDevicePresetSnapshot,
-  artifacts: DeviceAgentArtifacts,
-  deviceRun: DeviceAgentRun,
-): DeviceRuntime {
+function createRuntime(deps: DeviceAgentDeps): DeviceRuntime {
+  const { device } = deps
   return {
     device,
-    artifacts,
+    artifacts: deps.artifacts,
     deviceRun: {
-      ...deviceRun,
+      deviceId: device.selectionId,
+      platformId: device.platformId,
+      presetId: device.presetId,
+      presetName: device.presetName,
       cliDeviceName: '',
       status: 'queued',
       steps: [],
+      replaySteps: [],
+      viewportMetrics: null,
+      screenshotPixelSize: null,
+      finalScreenshotPath: null,
+      finalScreenshotUrl: null,
       testScriptUrl: null,
-      summary: null,
       error: null,
+      summary: null,
       durationMs: null,
     },
-    session: sanitizeSessionId(`agent-${deps.runId.slice(-8)}-${device.selectionId}`),
+    session: getDeviceAgentSessionId(deps.runId, device.selectionId),
     safeDeviceId: sanitizeDeviceDir(device.selectionId),
     recordedSteps: [],
     startedAt: Date.now(),
@@ -219,10 +184,11 @@ function createLeaderRuntime(
   }
 }
 
-async function launchLeader(
-  deps: SharedDeviceAgentDeps,
-  runtime: DeviceRuntime,
-): Promise<string | null> {
+export function getDeviceAgentSessionId(runId: string, deviceId: string): string {
+  return sanitizeSessionId(`agent-${runId.slice(-8)}-${deviceId}`)
+}
+
+async function launchDevice(deps: DeviceAgentDeps, runtime: DeviceRuntime): Promise<string | null> {
   const { device, session } = runtime
   setStatus(deps, runtime.deviceRun, 'launching', null)
   try {
@@ -232,7 +198,7 @@ async function launchLeader(
     if (!gotoResult.ok) throw new Error(resultError(gotoResult, '打开页面失败'))
 
     const before = await tryPrepareObservation(deps.cliBridge, session)
-    const observation = await observeLeaderPage(deps, runtime, 0, 'goto', before)
+    const observation = await observeDevicePage(deps, runtime, 0, 'goto', before)
     appendStep(deps, runtime, {
       stepIndex: 0,
       command: 'goto',
@@ -248,6 +214,7 @@ async function launchLeader(
       snapshotMeta: observation.snapshotMeta,
       screenshotUrl: observation.screenshotUrl,
       locator: null,
+      replayLocator: null,
       startedAt: new Date(runtime.startedAt).toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - runtime.startedAt,
@@ -271,6 +238,7 @@ async function launchLeader(
       snapshotMeta: null,
       screenshotUrl: null,
       locator: null,
+      replayLocator: null,
       startedAt: new Date(runtime.startedAt).toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - runtime.startedAt,
@@ -279,18 +247,36 @@ async function launchLeader(
   }
 }
 
-async function nextAction(
-  llm: ReturnType<typeof createDeviceLlmClient>,
+async function nextActionWithRetry(
+  deps: DeviceAgentDeps,
+  llm: DeviceLlmClient,
 ): Promise<{ value: NextActionResult } | { error: string }> {
-  try {
-    return { value: await llm.nextAction() }
-  } catch (error) {
-    return { error: errorMessage(error) }
+  let lastError = ''
+  for (let attempt = 1; attempt <= GATEWAY_RETRY_LIMIT; attempt++) {
+    if (deps.isCancelled?.()) return { error: '任务已取消' }
+    try {
+      return { value: await llm.nextAction() }
+    } catch (error) {
+      lastError = errorMessage(error)
+      if (!isRetryableGatewayError(lastError) || attempt === GATEWAY_RETRY_LIMIT) {
+        return { error: lastError }
+      }
+      const baseDelay = deps.gatewayRetryDelayMs ?? GATEWAY_RETRY_BASE_DELAY_MS
+      const jitter = baseDelay > 0 ? Math.floor(Math.random() * Math.max(1, baseDelay / 4)) : 0
+      await delay(baseDelay * 2 ** (attempt - 1) + jitter)
+    }
   }
+  return { error: lastError || 'AI 网关调用失败' }
 }
 
-async function executeLeaderAction(
-  deps: SharedDeviceAgentDeps,
+function isRetryableGatewayError(message: string): boolean {
+  return /(?:\b429\b|too many requests|rate.?limit|\b5\d\d\b|timeout|timed out|network|ECONNRESET|ECONNREFUSED)/i.test(
+    message,
+  )
+}
+
+async function executeDeviceAction(
+  deps: DeviceAgentDeps,
   runtime: DeviceRuntime,
   stepIndex: number,
   next: NextActionResult,
@@ -317,9 +303,17 @@ async function executeLeaderAction(
   }
 
   setStatus(deps, runtime.deviceRun, 'capturing', null)
-  const observation = await observeLeaderPage(deps, runtime, stepIndex, command, before)
-  if (result.ok)
-    runtime.recordedSteps.push({ command, args: [...next.args], purpose: next.purpose, locator })
+  const observation = await observeDevicePage(deps, runtime, stepIndex, command, before)
+  if (result.ok) {
+    runtime.recordedSteps.push({
+      stepIndex,
+      command,
+      args: [...next.args],
+      purpose: next.purpose,
+      locator,
+      replayLocator: null,
+    })
+  }
   const completedAt = new Date().toISOString()
   const output = result.ok
     ? limitOutput(result.output)
@@ -339,6 +333,7 @@ async function executeLeaderAction(
     snapshotMeta: observation.snapshotMeta,
     screenshotUrl: observation.screenshotUrl,
     locator,
+    replayLocator: null,
     startedAt,
     completedAt,
     durationMs: Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime()),
@@ -357,68 +352,7 @@ async function executeLeaderAction(
   }
 }
 
-async function captureViewport(
-  deps: SharedDeviceAgentDeps,
-  leaderRuntime: DeviceRuntime,
-  device: ScreenshotDevicePresetSnapshot,
-  deviceRun: DeviceAgentRun,
-): Promise<void> {
-  const artifacts = deps.artifacts.get(device.selectionId)
-  if (!artifacts) {
-    setStatus(deps, deviceRun, 'failed', '设备截图目录不存在')
-    return
-  }
-  const startedAt = Date.now()
-  setStatus(deps, deviceRun, 'capturing', null)
-  try {
-    const resizeResult = await deps.cliBridge.configureViewport(
-      leaderRuntime.session,
-      viewportOptions(device),
-    )
-    if (!resizeResult.ok) throw new Error(resultError(resizeResult, '切换逻辑视口失败'))
-    const before = await tryPrepareObservation(deps.cliBridge, leaderRuntime.session)
-    await safeWaitForPageReady(deps.cliBridge, leaderRuntime.session, 'resize', before)
-    if ((deps.screenshotDelayMs ?? 0) > 0) await delay(deps.screenshotDelayMs ?? 0)
-    const shot = await deps.cliBridge.screenshot(
-      leaderRuntime.session,
-      artifacts.finalScreenshotPath,
-      viewportOptions(device),
-    )
-    if (!shot.ok) throw new Error(resultError(shot, '保存最终截图失败'))
-    deviceRun.finalScreenshotPath = `data/runs/${deps.runId}/${sanitizeDeviceDir(device.selectionId)}.png`
-    deviceRun.finalScreenshotUrl = `/outputs/${deps.runId}/${sanitizeDeviceDir(device.selectionId)}.png`
-    deviceRun.durationMs = Date.now() - startedAt
-    setStatus(deps, deviceRun, 'completed', null)
-  } catch (error) {
-    deviceRun.finalScreenshotPath = null
-    deviceRun.finalScreenshotUrl = null
-    deviceRun.durationMs = Date.now() - startedAt
-    setStatus(deps, deviceRun, 'failed', errorMessage(error))
-  }
-}
-
-function failLeaderAndTargets(
-  deps: SharedDeviceAgentDeps,
-  leaderRuntime: DeviceRuntime,
-  runs: Map<string, DeviceAgentRun>,
-  captureIds: ReadonlySet<string>,
-  error: string,
-): void {
-  leaderRuntime.deviceRun.durationMs = Date.now() - leaderRuntime.startedAt
-  setStatus(deps, leaderRuntime.deviceRun, 'failed', error)
-  for (const device of deps.devices) {
-    if (
-      device.selectionId === leaderRuntime.device.selectionId ||
-      !captureIds.has(device.selectionId)
-    )
-      continue
-    const deviceRun = runs.get(device.selectionId)!
-    deviceRun.durationMs = 0
-    setStatus(deps, deviceRun, 'failed', '主设备 Agent 未完成，未生成视口截图')
-  }
-}
-
-async function writeLeaderSpec(deps: SharedDeviceAgentDeps, runtime: DeviceRuntime): Promise<void> {
+async function writeDeviceSpec(deps: DeviceAgentDeps, runtime: DeviceRuntime): Promise<void> {
   try {
     const content = generateSpec(runtime.device, deps.url, deps.task, runtime.recordedSteps)
     await writeFile(`${runtime.artifacts.specDir}/agent.spec.ts`, content, 'utf8')
@@ -429,8 +363,86 @@ async function writeLeaderSpec(deps: SharedDeviceAgentDeps, runtime: DeviceRunti
   }
 }
 
-async function observeLeaderPage(
-  deps: SharedDeviceAgentDeps,
+async function captureFinalScreenshot(
+  deps: DeviceAgentDeps,
+  runtime: DeviceRuntime,
+): Promise<string | null> {
+  setStatus(deps, runtime.deviceRun, 'capturing', runtime.deviceRun.error)
+  try {
+    const before = await tryPrepareObservation(deps.cliBridge, runtime.session)
+    await safeWaitForPageReady(deps.cliBridge, runtime.session, 'capture', before)
+    if ((deps.screenshotDelayMs ?? 0) > 0) await delay(deps.screenshotDelayMs ?? 0)
+
+    runtime.deviceRun.viewportMetrics = await collectViewportMetrics(
+      deps.cliBridge,
+      runtime.session,
+    )
+    const shot = await deps.cliBridge.screenshot(
+      runtime.session,
+      runtime.artifacts.finalScreenshotPath,
+    )
+    if (!shot.ok) throw new Error(resultError(shot, '保存最终截图失败'))
+    runtime.deviceRun.screenshotPixelSize = await readPngSize(runtime.artifacts.finalScreenshotPath)
+    runtime.deviceRun.finalScreenshotPath = `data/runs/${deps.runId}/${runtime.safeDeviceId}.png`
+    runtime.deviceRun.finalScreenshotUrl = `/outputs/${deps.runId}/${runtime.safeDeviceId}.png`
+    return null
+  } catch (error) {
+    return errorMessage(error)
+  }
+}
+
+async function collectViewportMetrics(
+  bridge: AgentCliBridge,
+  session: string,
+): Promise<AgentViewportMetrics | null> {
+  const result = await bridge.runCode(
+    session,
+    String.raw`async (page) => JSON.stringify(await page.evaluate(() => {
+      const viewportMeta = document.querySelector('meta[name="viewport"]')?.getAttribute('content') ?? ''
+      const widthMatch = viewportMeta.match(/(?:^|,)\s*width\s*=\s*([0-9.]+)/i)
+      return {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        screenWidth: window.screen.width,
+        screenHeight: window.screen.height,
+        devicePixelRatio: window.devicePixelRatio,
+        maxTouchPoints: navigator.maxTouchPoints,
+        pointerCoarse: matchMedia('(pointer: coarse)').matches,
+        visualViewportWidth: window.visualViewport?.width ?? null,
+        visualViewportHeight: window.visualViewport?.height ?? null,
+        visualViewportScale: window.visualViewport?.scale ?? null,
+        viewportMetaWidth: widthMatch ? Number(widthMatch[1]) : null,
+      }
+    }))`,
+  )
+  if (!result.ok) return null
+  try {
+    let parsed: unknown = JSON.parse(result.output)
+    if (typeof parsed === 'string') parsed = JSON.parse(parsed)
+    return parsed as AgentViewportMetrics
+  } catch {
+    return null
+  }
+}
+
+async function readPngSize(path: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const buffer = await readFile(path)
+    if (
+      buffer.length < 24 ||
+      buffer.toString('ascii', 1, 4) !== 'PNG' ||
+      buffer.toString('ascii', 12, 16) !== 'IHDR'
+    ) {
+      return null
+    }
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
+  } catch {
+    return null
+  }
+}
+
+async function observeDevicePage(
+  deps: DeviceAgentDeps,
   runtime: DeviceRuntime,
   stepIndex: number,
   command: string,
@@ -475,34 +487,28 @@ async function observeLeaderPage(
     }
     if (changed && snapshotRef) runtime.lastSnapshot = { sha256, stepIndex, snapshotRef }
   }
+
   if ((deps.screenshotDelayMs ?? 0) > 0) await delay(deps.screenshotDelayMs ?? 0)
   const shotPath = `${runtime.artifacts.screenshotsDir}/${String(stepIndex).padStart(2, '0')}.png`
   let screenshotUrl: string | null = null
   try {
-    const shot = await deps.cliBridge.screenshot(
-      runtime.session,
-      shotPath,
-      viewportOptions(runtime.device),
-    )
-    if (shot.ok)
+    const shot = await deps.cliBridge.screenshot(runtime.session, shotPath)
+    if (shot.ok) {
       screenshotUrl = `/outputs/${deps.runId}/agent/${runtime.safeDeviceId}/steps/${String(stepIndex).padStart(2, '0')}.png`
+    }
   } catch {
     // Keep the step even when its screenshot cannot be saved.
   }
   return { wait: readiness.wait, page: readiness.page, snapshot, snapshotMeta, screenshotUrl }
 }
 
-function appendStep(
-  deps: SharedDeviceAgentDeps,
-  runtime: DeviceRuntime,
-  step: DeviceAgentStep,
-): void {
+function appendStep(deps: DeviceAgentDeps, runtime: DeviceRuntime, step: DeviceAgentStep): void {
   runtime.deviceRun.steps.push(step)
   deps.onDeviceStep(runtime.device.selectionId, step)
 }
 
 function setStatus(
-  deps: SharedDeviceAgentDeps,
+  deps: DeviceAgentDeps,
   deviceRun: DeviceAgentRun,
   status: AgentRunStatus,
   error: string | null,
@@ -552,9 +558,7 @@ async function safeWaitForPageReady(
 }
 
 function supportsLocator(command: string): boolean {
-  return !['snapshot', 'find', 'goto', 'go-back', 'go-forward', 'reload', 'press', 'eval'].includes(
-    command,
-  )
+  return !['snapshot', 'find', 'goto', 'go-back', 'go-forward', 'reload', 'eval'].includes(command)
 }
 
 function resultError(result: CliResult, fallback: string): string {

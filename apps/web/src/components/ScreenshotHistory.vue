@@ -622,10 +622,14 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
               {{ agentRun.url }}
             </a>
             <p class="agent-task">{{ agentRun.task }}</p>
-            <dl class="batch-stats">
+            <dl class="batch-stats agent-stats">
               <div>
                 <dt>创建时间</dt>
                 <dd>{{ formatDate(agentRun.createdAt) }}</dd>
+              </div>
+              <div>
+                <dt>重跑时间</dt>
+                <dd>{{ agentRun.rerunAt ? formatDate(agentRun.rerunAt) : '暂无' }}</dd>
               </div>
               <div>
                 <dt>耗时</dt>
@@ -1151,6 +1155,42 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
   font-weight: 650;
 }
 
+.agent-stats {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-stats div {
+  flex: 0 1 104px;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  background: var(--color-surface-subtle);
+}
+
+.agent-stats div:nth-child(1),
+.agent-stats div:nth-child(2) {
+  flex-basis: 142px;
+}
+
+.agent-stats div:nth-child(5) {
+  flex-basis: 170px;
+}
+
+.agent-stats div:nth-child(6),
+.agent-stats div:nth-child(7) {
+  flex-basis: 72px;
+}
+
+.agent-stats dd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .rerun-dialog-copy {
   margin: 0 0 14px;
   color: var(--color-text-muted);
@@ -1290,6 +1330,14 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
 
   .batch-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .batch-stats.agent-stats {
+    display: grid;
+  }
+
+  .agent-stats div {
+    padding: 8px 10px;
   }
 }
 </style>

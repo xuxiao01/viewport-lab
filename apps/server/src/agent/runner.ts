@@ -8,13 +8,12 @@ import type {
 import type { AgentEvent } from '@viewport-lab/shared'
 import { createArchiveId } from '../run-archive.js'
 import { ConcurrencyScheduler } from '../task-scheduler.js'
-import type { AgentCliBridge } from './cli-bridge.js'
 import { createCliBridge } from './cli-bridge.js'
+import type { AgentCliBridge } from './cli-bridge.js'
 import { readAgentGatewayConfig } from './config.js'
 import type { AgentGatewayConfig } from './config.js'
-import { runSharedDeviceAgent } from './device-agent.js'
+import { getDeviceAgentSessionId, runDeviceAgent } from './device-agent.js'
 import {
-  clearDeviceAgentArtifacts,
   clearDeviceArtifacts,
   ensureDeviceDirs,
   ensureRunDirs,
@@ -27,7 +26,14 @@ export type AgentEventSink = (event: AgentEvent) => void
 export type { AgentEvent } from '@viewport-lab/shared'
 
 const activeRerunIds = new Set<string>()
-const agentScheduler = new ConcurrencyScheduler(3)
+const cancelledRunIds = new Set<string>()
+const activeRunExecutions = new Map<string, Promise<void>>()
+const activeDeviceSessions = new Map<
+  string,
+  Map<string, { bridge: AgentCliBridge; session: string }>
+>()
+export const AGENT_DEVICE_CONCURRENCY = 5
+const agentDeviceScheduler = new ConcurrencyScheduler(AGENT_DEVICE_CONCURRENCY)
 
 export async function startAgentRun(params: {
   url: string
@@ -54,6 +60,9 @@ export async function startAgentRun(params: {
     cliDeviceName: '',
     status: 'queued',
     steps: [],
+    replaySteps: [],
+    viewportMetrics: null,
+    screenshotPixelSize: null,
     finalScreenshotPath: null,
     finalScreenshotUrl: null,
     testScriptUrl: null,
@@ -64,11 +73,12 @@ export async function startAgentRun(params: {
 
   const initialRun: AgentRun = {
     kind: 'agent',
-    executionMode: 'leader_resize_capture',
-    leaderDeviceId: devices[0]!.selectionId,
+    executionMode: 'per_device',
+    leaderDeviceId: null,
     runId,
     createdAt,
     updatedAt: createdAt,
+    rerunAt: null,
     completedAt: null,
     status: 'queued',
     url,
@@ -89,9 +99,8 @@ export async function startAgentRun(params: {
   registerActiveAgentRecorder(recorder)
   emit({ type: 'status', run: recorder.run })
 
-  agentScheduler.enqueue(async () => {
+  const execution = (async () => {
     try {
-      const cliBridge = createCliBridge()
       recorder.setStatus('running')
       await recorder.persist()
       emit({ type: 'status', run: recorder.run })
@@ -103,7 +112,6 @@ export async function startAgentRun(params: {
         maxTurns,
         runId,
         gatewayConfig,
-        cliBridge,
         emit,
       })
     } catch (error: unknown) {
@@ -116,7 +124,8 @@ export async function startAgentRun(params: {
         unregisterActiveAgentRecorder(runId, recorder)
       }
     }
-  })
+  })()
+  trackRunExecution(runId, execution)
 
   return recorder.run
 }
@@ -136,26 +145,18 @@ export async function rerunAgentRunInPlace(params: {
   }
 
   try {
-    await Promise.all([
-      ...selectedDevices.map((device) => clearDeviceArtifacts(sourceRun.runId, device.selectionId)),
-      ...(selectedIdsHas(sourceRun.leaderDeviceId, selectedDevices)
-        ? []
-        : sourceRun.leaderDeviceId
-          ? [clearDeviceAgentArtifacts(sourceRun.runId, sourceRun.leaderDeviceId)]
-          : []),
-    ])
+    await Promise.all(
+      selectedDevices.map((device) => clearDeviceArtifacts(sourceRun.runId, device.selectionId)),
+    )
     const selectedIds = new Set(selectedDevices.map((device) => device.selectionId))
-    const leaderDevice =
-      sourceRun.devices.find((device) => device.selectionId === sourceRun.leaderDeviceId) ??
-      sourceRun.devices[0]!
-    const updatedIds = new Set([...selectedIds, leaderDevice.selectionId])
     const rerunAt = new Date().toISOString()
     const gatewayConfig = readAgentGatewayConfig()
     const initialRun: AgentRun = {
       ...sourceRun,
-      executionMode: 'leader_resize_capture',
-      leaderDeviceId: leaderDevice.selectionId,
+      executionMode: 'per_device',
+      leaderDeviceId: null,
       updatedAt: rerunAt,
+      rerunAt,
       completedAt: null,
       status: 'queued',
       model: gatewayConfig?.model ?? sourceRun.model,
@@ -166,6 +167,9 @@ export async function rerunAgentRunInPlace(params: {
               cliDeviceName: '',
               status: 'queued',
               steps: [],
+              replaySteps: [],
+              viewportMetrics: null,
+              screenshotPixelSize: null,
               finalScreenshotPath: null,
               finalScreenshotUrl: null,
               testScriptUrl: null,
@@ -173,17 +177,7 @@ export async function rerunAgentRunInPlace(params: {
               summary: null,
               durationMs: null,
             }
-          : deviceRun.deviceId === leaderDevice.selectionId
-            ? {
-                ...deviceRun,
-                cliDeviceName: '',
-                steps: [],
-                testScriptUrl: null,
-                summary: null,
-                error: null,
-                durationMs: null,
-              }
-            : deviceRun,
+          : deviceRun,
       ),
       error: null,
       durationMs: null,
@@ -195,9 +189,8 @@ export async function rerunAgentRunInPlace(params: {
     registerActiveAgentRecorder(recorder)
     emit({ type: 'status', run: recorder.run })
 
-    agentScheduler.enqueue(async () => {
+    const execution = (async () => {
       try {
-        const cliBridge = createCliBridge()
         recorder.setStatus('running')
         await recorder.persist()
         emit({ type: 'status', run: recorder.run })
@@ -205,14 +198,11 @@ export async function rerunAgentRunInPlace(params: {
           recorder,
           devices: sourceRun.devices,
           captureDeviceIds: selectedIds,
-          leaderDeviceId: leaderDevice.selectionId,
-          existingDeviceRuns: initialRun.deviceRuns,
           url: sourceRun.url,
           task: sourceRun.task,
           maxTurns: sourceRun.maxTurns,
           runId: sourceRun.runId,
           gatewayConfig,
-          cliBridge,
           emit,
         })
       } catch (error: unknown) {
@@ -226,11 +216,12 @@ export async function rerunAgentRunInPlace(params: {
           activeRerunIds.delete(sourceRun.runId)
         }
       }
-    })
+    })()
+    trackRunExecution(sourceRun.runId, execution)
 
     return {
       run: recorder.run,
-      selectionIds: [...updatedIds],
+      selectionIds: [...selectedIds],
     }
   } catch (error) {
     activeRerunIds.delete(sourceRun.runId)
@@ -252,29 +243,22 @@ export function selectRerunDevices(
   })
 }
 
-function selectedIdsHas(
-  deviceId: string | null,
-  devices: ScreenshotDevicePresetSnapshot[],
-): boolean {
-  return deviceId !== null && devices.some((device) => device.selectionId === deviceId)
-}
-
 async function runAllDevices(params: {
   recorder: AgentRunRecorder
   devices: ScreenshotDevicePresetSnapshot[]
   captureDeviceIds?: ReadonlySet<string>
-  leaderDeviceId?: string
-  existingDeviceRuns?: DeviceAgentRun[]
   url: string
   task: string
   maxTurns: number
   runId: string
   gatewayConfig: AgentGatewayConfig | null
-  cliBridge: AgentCliBridge
   emit: AgentEventSink
 }): Promise<void> {
   const executionStartedAt = Date.now()
-  const { recorder, devices, url, task, maxTurns, runId, gatewayConfig, cliBridge, emit } = params
+  const { recorder, devices, url, task, maxTurns, runId, gatewayConfig, emit } = params
+  const targetDevices = params.captureDeviceIds
+    ? devices.filter((device) => params.captureDeviceIds?.has(device.selectionId))
+    : devices
   let persistQueue = Promise.resolve()
   const queuePersist = (): void => {
     persistQueue = persistQueue.then(
@@ -284,61 +268,132 @@ async function runAllDevices(params: {
   }
   const artifacts = new Map(
     await Promise.all(
-      devices.map(
+      targetDevices.map(
         async (device) =>
           [device.selectionId, await ensureDeviceDirs(runId, device.selectionId)] as const,
       ),
     ),
   )
 
-  const deviceRuns = await runSharedDeviceAgent({
-    devices,
-    ...(params.captureDeviceIds ? { captureDeviceIds: params.captureDeviceIds } : {}),
-    ...(params.leaderDeviceId ? { leaderDeviceId: params.leaderDeviceId } : {}),
-    ...(params.existingDeviceRuns ? { existingDeviceRuns: params.existingDeviceRuns } : {}),
-    artifacts,
-    url,
-    task,
-    maxTurns,
-    runId,
-    gatewayConfig,
-    cliBridge,
-    onDeviceStatus: (deviceId, status, error) => {
-      recorder.setDeviceStatus(deviceId, status, error)
-      queuePersist()
-      emit({ type: 'device_status', runId, deviceId, status, error })
-      emit({ type: 'status', run: recorder.run })
-    },
-    onDeviceStep: (deviceId, step) => {
-      recorder.appendDeviceStep(deviceId, step)
-      queuePersist()
-      emit({ type: 'device_step', runId, deviceId, step, run: recorder.run })
-    },
-  })
+  await Promise.all(
+    targetDevices.map((device) =>
+      scheduleAgentDevice(async () => {
+        if (cancelledRunIds.has(runId)) {
+          recorder.setDeviceStatus(device.selectionId, 'cancelled', '任务已取消')
+          queuePersist()
+          emit({
+            type: 'device_status',
+            runId,
+            deviceId: device.selectionId,
+            status: 'cancelled',
+            error: '任务已取消',
+          })
+          return
+        }
+        const cliBridge = createCliBridge()
+        const session = getDeviceAgentSessionId(runId, device.selectionId)
+        registerDeviceSession(runId, device.selectionId, cliBridge, session)
+        try {
+          const deviceRun = await runDeviceAgent({
+            device,
+            artifacts: artifacts.get(device.selectionId)!,
+            url,
+            task,
+            maxTurns,
+            runId,
+            gatewayConfig,
+            cliBridge,
+            isCancelled: () => cancelledRunIds.has(runId),
+            onDeviceStatus: (deviceId, status, error) => {
+              recorder.setDeviceStatus(deviceId, status, error)
+              queuePersist()
+              emit({ type: 'device_status', runId, deviceId, status, error })
+              emit({ type: 'status', run: recorder.run })
+            },
+            onDeviceStep: (deviceId, step) => {
+              recorder.appendDeviceStep(deviceId, step)
+              queuePersist()
+              emit({ type: 'device_step', runId, deviceId, step, run: recorder.run })
+            },
+          })
+          recorder.updateDeviceRun(deviceRun.deviceId, deviceRun)
+          queuePersist()
+          emit({
+            type: 'device_completed',
+            runId,
+            deviceId: deviceRun.deviceId,
+            deviceRun,
+            run: recorder.run,
+          })
+        } finally {
+          unregisterDeviceSession(runId, device.selectionId)
+        }
+      }),
+    ),
+  )
 
   await persistQueue
-
-  for (const deviceRun of deviceRuns) {
-    recorder.updateDeviceRun(deviceRun.deviceId, deviceRun)
-    emit({
-      type: 'device_completed',
-      runId,
-      deviceId: deviceRun.deviceId,
-      deviceRun,
-      run: recorder.run,
-    })
-  }
-
   const now = new Date().toISOString()
+  const wasCancelled = cancelledRunIds.has(runId)
   const allCompleted = recorder.run.deviceRuns.every((dr) => dr.status === 'completed')
   const anyFailed = recorder.run.deviceRuns.some((dr) => dr.status === 'failed')
-  const batchStatus: AgentRunStatus = allCompleted
-    ? 'completed'
-    : anyFailed
-      ? 'failed'
-      : 'completed'
+  const batchStatus: AgentRunStatus = wasCancelled
+    ? 'cancelled'
+    : allCompleted
+      ? 'completed'
+      : anyFailed
+        ? 'failed'
+        : 'completed'
   recorder.setStatus(batchStatus)
   recorder.update({ completedAt: now, durationMs: Date.now() - executionStartedAt })
   await recorder.persist()
   emit({ type: 'status', run: recorder.run })
+}
+
+export async function cancelAgentRun(runId: string): Promise<void> {
+  cancelledRunIds.add(runId)
+  const sessions = [...(activeDeviceSessions.get(runId)?.values() ?? [])]
+  await Promise.all(
+    sessions.map(({ bridge, session }) => bridge.close(session).catch(() => undefined)),
+  )
+  await activeRunExecutions.get(runId)
+}
+
+function trackRunExecution(runId: string, execution: Promise<void>): void {
+  activeRunExecutions.set(runId, execution)
+  void execution.finally(() => {
+    if (activeRunExecutions.get(runId) === execution) activeRunExecutions.delete(runId)
+    cancelledRunIds.delete(runId)
+  })
+}
+
+function registerDeviceSession(
+  runId: string,
+  deviceId: string,
+  bridge: AgentCliBridge,
+  session: string,
+): void {
+  const sessions = activeDeviceSessions.get(runId) ?? new Map()
+  sessions.set(deviceId, { bridge, session })
+  activeDeviceSessions.set(runId, sessions)
+}
+
+function unregisterDeviceSession(runId: string, deviceId: string): void {
+  const sessions = activeDeviceSessions.get(runId)
+  sessions?.delete(deviceId)
+  if (sessions?.size === 0) activeDeviceSessions.delete(runId)
+}
+
+function scheduleAgentDevice(task: () => Promise<void>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    agentDeviceScheduler.enqueue(async () => {
+      try {
+        await task()
+        resolve()
+      } catch (error) {
+        reject(error)
+        throw error
+      }
+    })
+  })
 }

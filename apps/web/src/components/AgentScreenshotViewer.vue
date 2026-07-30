@@ -30,7 +30,11 @@ const preset = computed(() =>
           逻辑视口 {{ preset?.viewport.width ?? '—' }} × {{ preset?.viewport.height ?? '—' }}
         </span>
         <span>DPR {{ preset?.deviceScaleFactor ?? '—' }}</span>
-        <span>{{ device.steps.length }} 步</span>
+        <span v-if="device.steps.length > 0">Agent {{ device.steps.length }} 步</span>
+        <span v-if="device.replaySteps.length > 0">重放 {{ device.replaySteps.length }} 步</span>
+        <span v-if="device.screenshotPixelSize">
+          PNG {{ device.screenshotPixelSize.width }} × {{ device.screenshotPixelSize.height }}
+        </span>
       </div>
       <div class="viewer-canvas">
         <img :src="device.finalScreenshotUrl" :alt="`${device.presetName} 最终截图`" />

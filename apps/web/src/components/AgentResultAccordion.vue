@@ -69,6 +69,7 @@ function isInRerunList(deviceId: string): boolean {
 function executionRole(deviceId: string): string {
   if (props.run.executionMode === 'per_device') return '独立 Agent'
   if (props.run.leaderDeviceId === deviceId) return 'Agent 主设备'
+  if (props.run.executionMode === 'leader_context_replay') return '独立视口重放'
   return props.run.executionMode === 'leader_resize_capture' ? '切换视口截图' : '复用执行'
 }
 
@@ -78,7 +79,7 @@ function hasStepHistory(device: DeviceAgentRun): boolean {
 
 function canViewSteps(device: DeviceAgentRun): boolean {
   return (
-    props.run.executionMode !== 'leader_resize_capture' ||
+    !['leader_resize_capture', 'leader_context_replay'].includes(props.run.executionMode) ||
     props.run.leaderDeviceId === device.deviceId
   )
 }
@@ -113,7 +114,7 @@ function formatTime(value: string | null): string {
     <div class="results-heading">
       <div>
         <h2>设备截图</h2>
-        <p>主设备完成 Agent 操作后，系统切换各逻辑视口保存最终截图</p>
+        <p>每台设备使用独立 Agent 和浏览器环境执行完整任务并保存最终截图</p>
       </div>
     </div>
 
@@ -182,6 +183,13 @@ function formatTime(value: string | null): string {
                 <div v-if="hasStepHistory(device)">
                   <dt>运行步骤</dt>
                   <dd>{{ device.steps.length }} 步</dd>
+                </div>
+                <div v-if="device.replaySteps.length > 0">
+                  <dt>重放步骤</dt>
+                  <dd>
+                    {{ device.replaySteps.filter((step) => step.status === 'success').length }} /
+                    {{ device.replaySteps.length }} 步
+                  </dd>
                 </div>
                 <div v-if="hasStepHistory(device) && failedStepCount(device) > 0">
                   <dt>失败调用</dt>

@@ -50,6 +50,7 @@ function createRun(): AgentRun {
     runId: '2026-07-29_10-00-00-000_deadbeef',
     createdAt: now,
     updatedAt: now,
+    rerunAt: null,
     completedAt: null,
     status: 'queued',
     url: 'https://example.com',

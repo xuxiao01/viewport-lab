@@ -1,10 +1,12 @@
-import type { ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
+import type { AgentReplayLocator, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 
 export interface RecordedStep {
+  stepIndex: number
   command: string
   args: string[]
   purpose: string
   locator: string | null
+  replayLocator: AgentReplayLocator | null
 }
 
 export function generateSpec(

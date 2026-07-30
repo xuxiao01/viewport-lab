@@ -46,7 +46,7 @@ import {
   updateAgentRunNote,
   writeRetryRun,
 } from './recorder.js'
-import { rerunAgentRunInPlace, startAgentRun } from './runner.js'
+import { cancelAgentRun, rerunAgentRunInPlace, startAgentRun } from './runner.js'
 import type { AgentEventSink } from './runner.js'
 
 type Subscriber = (event: AgentEvent) => void
@@ -454,6 +454,7 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
     const { runId } = request.params
     const run = await readAgentRun(runId)
     if (!run) return reply.code(404).send({ error: 'Agent run not found' })
+    if (!isRunTerminal(run)) await cancelAgentRun(runId)
     subscribers.delete(runId)
     await rm(resolve(agentOutputsDir, runId), { recursive: true })
     return reply.code(204).send()
