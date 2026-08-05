@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ElMessage } from 'element-plus'
-import { computed, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { computed, onMounted, reactive, ref } from 'vue'
 
 import AppHeader from '../components/AppHeader.vue'
 
@@ -131,6 +131,16 @@ const diagnosticConfig = reactive({
 const running = ref(false)
 const response = ref<FontCheckResponse | null>(null)
 const expandedScenarioId = ref<string | null>(null)
+
+onMounted(() => {
+  void ElMessageBox.alert('工具尚未验证完成。', '提示', {
+    confirmButtonText: '我知道了',
+    type: 'warning',
+    showClose: false,
+    closeOnClickModal: false,
+    closeOnPressEscape: false,
+  })
+})
 
 const totalIssues = computed(
   () =>

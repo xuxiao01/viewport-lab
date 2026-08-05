@@ -1,0 +1,4 @@
+interface:
+  display_name: "项目文档规范"
+  short_description: "按 Viewport Lab 的 docs 与 local-doc 规范整理文档"
+  default_prompt: "请按当前项目的 docs 和 local-doc 规范整理这份文档。"

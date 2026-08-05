@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { batchNoteMaxLength } from '@viewport-lab/shared'
-import type { AgentGatewayStatus, CaptureDelayMs } from '@viewport-lab/shared'
+import { agentModelNames, agentTurnLimits, batchNoteMaxLength } from '@viewport-lab/shared'
+import type { AgentGatewayStatus, AgentModelName, CaptureDelayMs } from '@viewport-lab/shared'
 import { computed } from 'vue'
 
 import DevicePresetPanel from './DevicePresetPanel.vue'
@@ -13,6 +13,7 @@ const props = defineProps<{
   note: string
   aiTaskDescription: string
   maxTurns: number
+  model: AgentModelName
   captureDelayMs: CaptureDelayMs
   gatewayStatus: AgentGatewayStatus | null
   selectedCategories: PlatformId[]
@@ -20,6 +21,7 @@ const props = defineProps<{
   selectedPresetIds: string[]
   platforms: PlatformPresetGroup[]
   running: boolean
+  optimizing: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,10 +29,12 @@ const emit = defineEmits<{
   'update:note': [value: string]
   'update:aiTaskDescription': [value: string]
   'update:maxTurns': [value: number]
+  'update:model': [value: AgentModelName]
   'update:captureDelayMs': [value: CaptureDelayMs]
   'update:activeCategory': [value: PlatformId]
   'update:selectedPresetIds': [value: string[]]
   toggleCategory: [platformId: PlatformId]
+  optimizeTask: []
   start: []
 }>()
 
@@ -56,6 +60,15 @@ const isValidUrl = computed(() => {
 })
 
 const gatewayReady = computed(() => props.gatewayStatus?.configured ?? false)
+const modelOptions = agentModelNames.map((value) => ({ value, label: value }))
+const canOptimize = computed(
+  () =>
+    isValidUrl.value &&
+    props.aiTaskDescription.trim().length > 0 &&
+    gatewayReady.value &&
+    !props.running &&
+    !props.optimizing,
+)
 const canStart = computed(
   () =>
     isValidUrl.value &&
@@ -80,6 +93,12 @@ const captureModes: Array<{
     description: '首次就绪后等待 30 秒，再次检查稳定性',
   },
 ]
+
+function updateModel(value: string): void {
+  if (agentModelNames.includes(value as AgentModelName)) {
+    emit('update:model', value as AgentModelName)
+  }
+}
 </script>
 
 <template>
@@ -116,7 +135,19 @@ const captureModes: Array<{
       @update:model-value="emit('update:note', $event)"
     />
 
-    <label class="field-label spaced-label" for="ai-task-description"> AI 任务描述（可选） </label>
+    <div class="ai-task-label-row spaced-label">
+      <label class="field-label" for="ai-task-description">AI 任务描述（可选）</label>
+      <el-button
+        size="small"
+        plain
+        type="primary"
+        :loading="optimizing"
+        :disabled="!canOptimize"
+        @click="emit('optimizeTask')"
+      >
+        {{ optimizing ? '优化中…' : 'AI 优化任务' }}
+      </el-button>
+    </div>
     <el-input
       id="ai-task-description"
       :model-value="aiTaskDescription"
@@ -136,9 +167,7 @@ const captureModes: Array<{
       :class="{ ready: gatewayReady, unavailable: gatewayStatus && !gatewayReady }"
     >
       <template v-if="!gatewayStatus">正在检查 AI 网关配置…</template>
-      <template v-else-if="gatewayReady">
-        AI 网关已连接 · 模型 {{ gatewayStatus.model ?? '未指定' }}
-      </template>
+      <template v-else-if="gatewayReady">AI 网关已连接</template>
       <template v-else>
         AI 网关不可用{{ gatewayStatus.reason ? ` · ${gatewayStatus.reason}` : '' }}
       </template>
@@ -147,19 +176,39 @@ const captureModes: Array<{
     <template v-if="isAgentMode">
       <div class="mode-heading">
         <strong>Agent 设置</strong>
-        <span>限制 Agent 在每台设备上最多执行的操作轮数</span>
+        <span>设置每台设备的最大操作轮数和本次运行模型</span>
       </div>
       <div class="agent-settings">
-        <label for="agent-max-turns">最大轮数</label>
-        <el-input-number
-          id="agent-max-turns"
-          :model-value="maxTurns"
-          :min="1"
-          :max="100"
-          :disabled="running"
-          @update:model-value="typeof $event === 'number' && emit('update:maxTurns', $event)"
-        />
-        <span>范围 1–100，默认 50</span>
+        <div class="agent-setting-item">
+          <label for="agent-max-turns">最大轮数</label>
+          <el-input-number
+            id="agent-max-turns"
+            :model-value="maxTurns"
+            :min="agentTurnLimits.min"
+            :max="agentTurnLimits.max"
+            :disabled="running"
+            @update:model-value="typeof $event === 'number' && emit('update:maxTurns', $event)"
+          />
+          <span>范围 100–200，默认 150</span>
+        </div>
+        <div class="agent-setting-item model-setting">
+          <label for="agent-model">选择模型</label>
+          <el-select
+            id="agent-model"
+            :model-value="model"
+            :disabled="running"
+            aria-label="选择 Agent 模型"
+            @update:model-value="updateModel"
+          >
+            <el-option
+              v-for="option in modelOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+          <span>默认 deepseek-v4-flash-0731</span>
+        </div>
       </div>
     </template>
     <template v-else>
@@ -269,9 +318,9 @@ const captureModes: Array<{
 }
 
 .agent-settings {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
   min-height: 54px;
   padding: 10px 14px;
   border: 1px solid var(--color-border);
@@ -279,15 +328,28 @@ const captureModes: Array<{
   background: var(--color-surface-subtle);
 }
 
-.agent-settings label {
+.agent-setting-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.agent-setting-item label {
+  flex: 0 0 auto;
   color: var(--color-text-strong);
   font-size: 13px;
   font-weight: 650;
 }
 
-.agent-settings span {
+.agent-setting-item span {
   color: var(--color-text-muted);
   font-size: 12px;
+}
+
+.model-setting :deep(.el-select) {
+  width: 220px;
+  max-width: 100%;
 }
 
 .capture-mode {
@@ -381,6 +443,17 @@ const captureModes: Array<{
   margin-top: 15px;
 }
 
+.ai-task-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-task-label-row .field-label {
+  margin: 0;
+}
+
 .ai-helper {
   margin: 8px 0 0;
   color: var(--color-text-muted);
@@ -472,11 +545,15 @@ const captureModes: Array<{
   }
 
   .agent-settings {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-setting-item {
     align-items: flex-start;
     flex-wrap: wrap;
   }
 
-  .agent-settings span {
+  .agent-setting-item span {
     flex-basis: 100%;
   }
 

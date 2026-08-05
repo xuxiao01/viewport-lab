@@ -15,8 +15,8 @@ const emit = defineEmits<{
 }>()
 
 const activePanels = ref<string[]>([])
-const terminalStatuses = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled'])
-type AgentDisplayStatus = 'waiting' | 'in-progress' | 'success' | 'failure'
+const terminalStatuses = new Set<AgentRunStatus>(['completed', 'partial', 'failed', 'cancelled'])
+type AgentDisplayStatus = 'waiting' | 'in-progress' | 'success' | 'partial' | 'failure'
 
 const displayStatusByRunStatus: Record<AgentRunStatus, AgentDisplayStatus> = {
   queued: 'waiting',
@@ -26,6 +26,7 @@ const displayStatusByRunStatus: Record<AgentRunStatus, AgentDisplayStatus> = {
   executing: 'in-progress',
   capturing: 'in-progress',
   completed: 'success',
+  partial: 'partial',
   failed: 'failure',
   cancelled: 'failure',
 }
@@ -34,6 +35,7 @@ const displayStatusLabels: Record<AgentDisplayStatus, string> = {
   waiting: '等待',
   'in-progress': '进行中',
   success: '成功',
+  partial: '已结束（轮次上限）',
   failure: '失败',
 }
 

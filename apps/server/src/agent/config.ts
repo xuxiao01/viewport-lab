@@ -20,7 +20,7 @@ export function readAgentGatewayConfig(): AgentGatewayConfig | null {
   const apiKey = process.env.AGENT_GATEWAY_API_KEY
   if (!apiUrl || !apiKey) return null
   const vhost = process.env.AGENT_GATEWAY_VHOST ?? ''
-  const model = process.env.AGENT_GATEWAY_MODEL ?? 'deepseek-v4-flash'
+  const model = process.env.AGENT_GATEWAY_MODEL ?? 'deepseek-v4-flash-0731'
   const timeoutRaw = Number(process.env.AGENT_GATEWAY_TIMEOUT_MS ?? '120000')
   const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : 120_000
   return { apiUrl, apiKey, vhost, model, timeoutMs }

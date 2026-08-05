@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { agentTurnLimits, defaultAgentModel } from '@viewport-lab/shared'
 import { ElMessage } from 'element-plus'
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -19,7 +20,7 @@ const router = useRouter()
 const url = ref('http://localhost:5188')
 const task = ref('')
 const note = ref('')
-const maxTurns = ref(50)
+const maxTurns = ref(agentTurnLimits.default)
 const selectedCategories = ref<PlatformId[]>(['ios-phone'])
 const activeCategory = ref<PlatformId | null>('ios-phone')
 const selectedPresetIds = ref<string[]>([...defaultSelectedPresetIds])
@@ -76,6 +77,7 @@ async function startAgentRun(): Promise<void> {
     note: note.value.trim(),
     selectedPresetIds: effectiveSelectedPresetIds.value,
     maxTurns: maxTurns.value,
+    model: defaultAgentModel,
   })
   if (!run) {
     ElMessage.error(store.error ?? '创建 Agent 运行失败')
@@ -120,7 +122,11 @@ onMounted(() => {
         </div>
         <div class="form-row">
           <label>最大轮数</label>
-          <el-input-number v-model="maxTurns" :min="1" :max="100" />
+          <el-input-number
+            v-model="maxTurns"
+            :min="agentTurnLimits.min"
+            :max="agentTurnLimits.max"
+          />
         </div>
         <div class="form-row">
           <label>设备视口</label>

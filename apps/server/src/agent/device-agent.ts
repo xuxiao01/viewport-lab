@@ -1,5 +1,8 @@
 import type {
+  AgentBlockedModalState,
+  AgentFileUploadState,
   AgentPageState,
+  AgentNativeDialogState,
   AgentRunStatus,
   AgentSnapshotMeta,
   AgentWaitResult,
@@ -11,11 +14,16 @@ import type {
 import { createHash } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 
-import type { AgentCliBridge, CliResult } from './cli-bridge.js'
-import { sanitizeSessionId } from './cli-bridge.js'
+import type { AgentCliBridge, CliModalState, CliResult } from './cli-bridge.js'
+import {
+  DEFAULT_AGENT_UPLOAD_FILE_NAME,
+  DEFAULT_AGENT_UPLOAD_PATH,
+  isCliModalStateError,
+  sanitizeSessionId,
+} from './cli-bridge.js'
 import type { AgentGatewayConfig } from './config.js'
 import type { ActionResultReport, DeviceLlmClient, NextActionResult } from './llm-client.js'
-import { createDeviceLlmClient } from './llm-client.js'
+import { classifyGatewayError, createDeviceLlmClient } from './llm-client.js'
 import { preparePageObservation, waitForPageReady } from './page-readiness.js'
 import { sanitizeDeviceDir } from './recorder.js'
 import type { RecordedStep } from './test-script-generator.js'
@@ -63,6 +71,10 @@ interface DeviceRuntime {
   recordedSteps: RecordedStep[]
   startedAt: number
   lastSnapshot: { sha256: string; stepIndex: number; snapshotRef: string } | null
+  pendingDialog: AgentNativeDialogState | null
+  blockedModal: AgentBlockedModalState | null
+  lastFailureFingerprint: string | null
+  consecutiveFailureCount: number
 }
 
 interface PageObservation {
@@ -71,6 +83,8 @@ interface PageObservation {
   snapshot: string | null
   snapshotMeta: AgentSnapshotMeta | null
   screenshotUrl: string | null
+  dialog: AgentNativeDialogState | null
+  blockedModal: AgentBlockedModalState | null
 }
 
 /**
@@ -81,6 +95,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
   const runtime = createRuntime(deps)
   let failure: string | null = null
   let completedByModel = false
+  let reachedTurnLimit = false
 
   try {
     if (deps.isCancelled?.()) {
@@ -89,7 +104,9 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
     }
     failure = await launchDevice(deps, runtime)
     if (!failure) {
-      const initialSnapshot = runtime.deviceRun.steps[0]?.snapshot ?? '(snapshot unavailable)'
+      const initialSnapshot = runtime.pendingDialog
+        ? formatDialogForModel(runtime.pendingDialog)
+        : (runtime.deviceRun.steps[0]?.snapshot ?? '(snapshot unavailable)')
       const createLlmClient = deps.createLlmClient ?? createDeviceLlmClient
       const llm = createLlmClient(
         deps.gatewayConfig,
@@ -108,6 +125,23 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
             failure = next.error
             break
           }
+          if (next.value.done && runtime.pendingDialog) {
+            llm.reportResult({
+              ok: false,
+              error: '当前存在尚未处理的浏览器原生弹窗，请先接受或取消弹窗',
+              command: 'finish',
+              output: '',
+              wait: null,
+              page: runtime.deviceRun.steps.at(-1)?.page ?? null,
+              snapshot: null,
+              snapshotMeta: null,
+              screenshotUrl: null,
+              dialog: runtime.pendingDialog,
+              blockedModal: null,
+              fileUpload: null,
+            })
+            continue
+          }
           if (next.value.done) {
             runtime.deviceRun.summary = next.value.summary
             completedByModel = true
@@ -117,14 +151,24 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
             failure = 'LLM 未返回命令且未声明完成'
             break
           }
-          const report = await executeDeviceAction(deps, runtime, turn, next.value)
-          llm.reportResult(report)
+          const actionResult = await executeDeviceAction(deps, runtime, turn, next.value)
+          if (actionResult.terminalError) {
+            failure = actionResult.terminalError
+            break
+          }
+          const circuitError = updateFailureCircuit(runtime, actionResult.report)
+          if (circuitError) {
+            failure = circuitError
+            break
+          }
+          llm.reportResult(actionResult.report)
         }
       } finally {
         llm.close()
       }
       if (!completedByModel && !failure && !deps.isCancelled?.()) {
-        failure = `Agent 达到最大轮数 ${deps.maxTurns}，未收到完成信号`
+        reachedTurnLimit = true
+        runtime.deviceRun.error = `已达到最大轮数 ${deps.maxTurns}，探索在轮次预算内正常结束；未收到任务完成信号`
       }
     }
 
@@ -149,6 +193,7 @@ export async function runDeviceAgent(deps: DeviceAgentDeps): Promise<DeviceAgent
 
   if (deps.isCancelled?.()) setStatus(deps, runtime.deviceRun, 'cancelled', '任务已取消')
   else if (failure) setStatus(deps, runtime.deviceRun, 'failed', failure)
+  else if (reachedTurnLimit) setStatus(deps, runtime.deviceRun, 'partial', runtime.deviceRun.error)
   else setStatus(deps, runtime.deviceRun, 'completed', null)
   return runtime.deviceRun
 }
@@ -181,6 +226,10 @@ function createRuntime(deps: DeviceAgentDeps): DeviceRuntime {
     recordedSteps: [],
     startedAt: Date.now(),
     lastSnapshot: null,
+    pendingDialog: null,
+    blockedModal: null,
+    lastFailureFingerprint: null,
+    consecutiveFailureCount: 0,
   }
 }
 
@@ -199,15 +248,17 @@ async function launchDevice(deps: DeviceAgentDeps, runtime: DeviceRuntime): Prom
 
     const before = await tryPrepareObservation(deps.cliBridge, session)
     const observation = await observeDevicePage(deps, runtime, 0, 'goto', before)
+    runtime.pendingDialog = observation.dialog
+    runtime.blockedModal = observation.blockedModal
     appendStep(deps, runtime, {
       stepIndex: 0,
       command: 'goto',
       args: [deps.url],
       purpose: '打开页面',
-      status: 'success',
+      status: observation.blockedModal ? 'failed' : 'success',
       info: null,
       output: null,
-      error: null,
+      error: observation.blockedModal ? blockedModalError(observation.blockedModal) : null,
       wait: observation.wait,
       page: observation.page,
       snapshot: observation.snapshot,
@@ -215,10 +266,13 @@ async function launchDevice(deps: DeviceAgentDeps, runtime: DeviceRuntime): Prom
       screenshotUrl: observation.screenshotUrl,
       locator: null,
       replayLocator: null,
+      dialog: observation.dialog,
+      blockedModal: observation.blockedModal,
       startedAt: new Date(runtime.startedAt).toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - runtime.startedAt,
     })
+    if (observation.blockedModal) return blockedModalError(observation.blockedModal)
     setStatus(deps, runtime.deviceRun, 'running', null)
     return null
   } catch (error) {
@@ -239,6 +293,8 @@ async function launchDevice(deps: DeviceAgentDeps, runtime: DeviceRuntime): Prom
       screenshotUrl: null,
       locator: null,
       replayLocator: null,
+      dialog: null,
+      blockedModal: null,
       startedAt: new Date(runtime.startedAt).toISOString(),
       completedAt: new Date().toISOString(),
       durationMs: Date.now() - runtime.startedAt,
@@ -255,24 +311,20 @@ async function nextActionWithRetry(
   for (let attempt = 1; attempt <= GATEWAY_RETRY_LIMIT; attempt++) {
     if (deps.isCancelled?.()) return { error: '任务已取消' }
     try {
-      return { value: await llm.nextAction() }
+      return { value: await (attempt === 1 ? llm.nextAction() : llm.retryNextAction()) }
     } catch (error) {
       lastError = errorMessage(error)
-      if (!isRetryableGatewayError(lastError) || attempt === GATEWAY_RETRY_LIMIT) {
+      const classification = classifyGatewayError(error)
+      if (!classification.retryable || attempt === GATEWAY_RETRY_LIMIT) {
         return { error: lastError }
       }
       const baseDelay = deps.gatewayRetryDelayMs ?? GATEWAY_RETRY_BASE_DELAY_MS
       const jitter = baseDelay > 0 ? Math.floor(Math.random() * Math.max(1, baseDelay / 4)) : 0
-      await delay(baseDelay * 2 ** (attempt - 1) + jitter)
+      const delayMs = classification.retryAfterMs ?? baseDelay * 2 ** (attempt - 1) + jitter
+      await delay(delayMs)
     }
   }
   return { error: lastError || 'AI 网关调用失败' }
-}
-
-function isRetryableGatewayError(message: string): boolean {
-  return /(?:\b429\b|too many requests|rate.?limit|\b5\d\d\b|timeout|timed out|network|ECONNRESET|ECONNREFUSED)/i.test(
-    message,
-  )
 }
 
 async function executeDeviceAction(
@@ -280,30 +332,90 @@ async function executeDeviceAction(
   runtime: DeviceRuntime,
   stepIndex: number,
   next: NextActionResult,
-): Promise<ActionResultReport> {
+): Promise<{ report: ActionResultReport; terminalError: string | null }> {
   const command = next.command!
   const startedAt = new Date().toISOString()
   setStatus(deps, runtime.deviceRun, 'executing', null)
   let result: CliResult = { ok: false, output: '', error: '工具调用尚未执行' }
   let locator: string | null = null
   let before: Awaited<ReturnType<typeof tryPrepareObservation>> = null
+  const pendingBefore = runtime.pendingDialog
+  const dialogCommand = isDialogCommand(command)
   try {
-    before = await tryPrepareObservation(deps.cliBridge, runtime.session)
-    const ref = next.args.find((arg) => /^[fe]\d/.test(arg)) ?? null
-    if (ref && supportsLocator(command)) {
-      const locatorResult = await deps.cliBridge.generateLocator(runtime.session, ref)
-      if (locatorResult.ok && locatorResult.output) locator = locatorResult.output
+    const validationError = validateDialogAction(command, next.args, pendingBefore)
+    if (validationError) {
+      result = { ok: false, output: '', error: validationError }
+    } else {
+      before = dialogCommand ? null : await tryPrepareObservation(deps.cliBridge, runtime.session)
+      const ref = next.args.find((arg) => /^[fe]\d/.test(arg)) ?? null
+      if (ref && supportsLocator(command)) {
+        const locatorResult = await deps.cliBridge.generateLocator(runtime.session, ref)
+        if (locatorResult.ok && locatorResult.output) locator = locatorResult.output
+      }
+      result =
+        command === 'snapshot'
+          ? { ok: true, output: 'Snapshot captured after page readiness.', error: null }
+          : await deps.cliBridge.execute(runtime.session, command, next.args)
     }
-    result =
-      command === 'snapshot'
-        ? { ok: true, output: 'Snapshot captured after page readiness.', error: null }
-        : await deps.cliBridge.execute(runtime.session, command, next.args)
   } catch (error) {
     result = { ok: false, output: '', error: errorMessage(error) }
   }
 
   setStatus(deps, runtime.deviceRun, 'capturing', null)
-  const observation = await observeDevicePage(deps, runtime, stepIndex, command, before)
+  let observation =
+    pendingBefore && !dialogCommand
+      ? observationWhileDialogOpen(runtime, pendingBefore)
+      : await observeDevicePage(deps, runtime, stepIndex, command, before)
+  let fileUpload: AgentFileUploadState | null = null
+  let uploadTerminalError: string | null = null
+  if (observation.blockedModal?.type === 'fileChooser') {
+    const uploadResult = await uploadDefaultAgentFile(deps.cliBridge, runtime.session)
+    fileUpload = {
+      fileName: DEFAULT_AGENT_UPLOAD_FILE_NAME,
+      status: uploadResult.ok ? 'uploaded' : 'failed',
+      error: uploadResult.ok ? null : resultError(uploadResult, '上传默认测试图片失败'),
+    }
+    if (uploadResult.ok) {
+      const afterUpload = await tryPrepareObservation(deps.cliBridge, runtime.session)
+      observation = await observeDevicePage(deps, runtime, stepIndex, 'upload', afterUpload)
+      result = {
+        ok: true,
+        output: `已自动上传默认测试图片 ${DEFAULT_AGENT_UPLOAD_FILE_NAME}`,
+        error: null,
+      }
+    } else {
+      uploadTerminalError = `检测到文件选择器，但自动上传默认测试图片失败：${fileUpload.error}`
+      result = { ok: false, output: uploadTerminalError, error: uploadTerminalError }
+    }
+  }
+  runtime.blockedModal = observation.blockedModal
+  const terminalError =
+    uploadTerminalError ??
+    (observation.blockedModal ? blockedModalError(observation.blockedModal) : null)
+  if (terminalError) {
+    result = { ok: false, output: terminalError, error: terminalError }
+  }
+  if (!result.ok && !pendingBefore && !dialogCommand && observation.dialog) {
+    result = {
+      ok: true,
+      output: `命令已触发 ${observation.dialog.type} 浏览器原生弹窗，等待 Agent 处理`,
+      error: null,
+    }
+  }
+  let stepDialog = observation.dialog
+  let handledDialog: AgentNativeDialogState | null = null
+  if (dialogCommand && result.ok && pendingBefore) {
+    handledDialog = {
+      ...pendingBefore,
+      status: 'handled',
+      action: command === 'dialog-accept' ? 'accept' : 'dismiss',
+      promptText: command === 'dialog-accept' ? (next.args[0] ?? null) : null,
+    }
+    stepDialog = observation.dialog ?? handledDialog
+  } else if (pendingBefore && !dialogCommand) {
+    stepDialog = pendingBefore
+  }
+  runtime.pendingDialog = observation.dialog ?? (result.ok && dialogCommand ? null : pendingBefore)
   if (result.ok) {
     runtime.recordedSteps.push({
       stepIndex,
@@ -312,6 +424,8 @@ async function executeDeviceAction(
       purpose: next.purpose,
       locator,
       replayLocator: null,
+      dialog: handledDialog,
+      fileUpload,
     })
   }
   const completedAt = new Date().toISOString()
@@ -334,21 +448,41 @@ async function executeDeviceAction(
     screenshotUrl: observation.screenshotUrl,
     locator,
     replayLocator: null,
+    dialog: stepDialog,
+    blockedModal: observation.blockedModal,
+    fileUpload,
     startedAt,
     completedAt,
     durationMs: Math.max(0, new Date(completedAt).getTime() - new Date(startedAt).getTime()),
   }
   appendStep(deps, runtime, step)
   return {
-    ok: result.ok,
-    error: result.error,
-    command,
-    output: limitOutput(result.output),
-    wait: observation.wait,
-    page: observation.page,
-    snapshot: observation.snapshot,
-    snapshotMeta: observation.snapshotMeta,
-    screenshotUrl: observation.screenshotUrl,
+    terminalError,
+    report: {
+      ok: result.ok,
+      error: result.error,
+      command,
+      output: limitOutput(result.output),
+      wait: observation.wait,
+      page: observation.page,
+      snapshot: observation.snapshot,
+      snapshotMeta: observation.snapshotMeta,
+      screenshotUrl: observation.screenshotUrl,
+      dialog: stepDialog,
+      blockedModal: observation.blockedModal,
+      fileUpload,
+    },
+  }
+}
+
+async function uploadDefaultAgentFile(
+  bridge: AgentCliBridge,
+  session: string,
+): Promise<CliResult> {
+  try {
+    return await bridge.execute(session, 'upload', [DEFAULT_AGENT_UPLOAD_PATH])
+  } catch (error) {
+    return { ok: false, output: '', error: errorMessage(error) }
   }
 }
 
@@ -369,6 +503,12 @@ async function captureFinalScreenshot(
 ): Promise<string | null> {
   setStatus(deps, runtime.deviceRun, 'capturing', runtime.deviceRun.error)
   try {
+    if (runtime.pendingDialog) {
+      throw new Error(
+        `存在尚未处理的浏览器原生弹窗：${formatDialogForModel(runtime.pendingDialog)}`,
+      )
+    }
+    if (runtime.blockedModal) throw new Error(blockedModalError(runtime.blockedModal))
     const before = await tryPrepareObservation(deps.cliBridge, runtime.session)
     await safeWaitForPageReady(deps.cliBridge, runtime.session, 'capture', before)
     if ((deps.screenshotDelayMs ?? 0) > 0) await delay(deps.screenshotDelayMs ?? 0)
@@ -449,11 +589,40 @@ async function observeDevicePage(
   before: Awaited<ReturnType<typeof tryPrepareObservation>>,
 ): Promise<PageObservation> {
   const readiness = await safeWaitForPageReady(deps.cliBridge, runtime.session, command, before)
+  let detectedModal =
+    before === null || waitContainsModalError(readiness.wait)
+      ? await inspectBrowserModal(deps.cliBridge, runtime.session, stepIndex)
+      : null
+  if (detectedModal) {
+    return {
+      wait: readiness.wait,
+      page: readiness.page,
+      snapshot: null,
+      snapshotMeta: null,
+      screenshotUrl: null,
+      dialog: detectedModal.dialog,
+      blockedModal: detectedModal.blockedModal,
+    }
+  }
   let snapshotResult: CliResult
   try {
     snapshotResult = await deps.cliBridge.snapshot(runtime.session)
   } catch (error) {
     snapshotResult = { ok: false, output: '', error: errorMessage(error) }
+  }
+  if (!snapshotResult.ok && isCliModalStateError(snapshotResult.error ?? snapshotResult.output)) {
+    detectedModal =
+      (await inspectBrowserModal(deps.cliBridge, runtime.session, stepIndex)) ??
+      createUnsupportedModal('未能识别的浏览器模态状态', stepIndex)
+    return {
+      wait: readiness.wait,
+      page: readiness.page,
+      snapshot: null,
+      snapshotMeta: null,
+      screenshotUrl: null,
+      dialog: detectedModal.dialog,
+      blockedModal: detectedModal.blockedModal,
+    }
   }
   let snapshot: string | null = null
   let snapshotMeta: AgentSnapshotMeta | null = null
@@ -495,11 +664,149 @@ async function observeDevicePage(
     const shot = await deps.cliBridge.screenshot(runtime.session, shotPath)
     if (shot.ok) {
       screenshotUrl = `/outputs/${deps.runId}/agent/${runtime.safeDeviceId}/steps/${String(stepIndex).padStart(2, '0')}.png`
+    } else if (isCliModalStateError(shot.error ?? shot.output)) {
+      detectedModal =
+        (await inspectBrowserModal(deps.cliBridge, runtime.session, stepIndex)) ??
+        createUnsupportedModal('截图时检测到未能识别的浏览器模态状态', stepIndex)
     }
   } catch {
     // Keep the step even when its screenshot cannot be saved.
   }
-  return { wait: readiness.wait, page: readiness.page, snapshot, snapshotMeta, screenshotUrl }
+  return {
+    wait: readiness.wait,
+    page: readiness.page,
+    snapshot,
+    snapshotMeta,
+    screenshotUrl,
+    dialog: detectedModal?.dialog ?? null,
+    blockedModal: detectedModal?.blockedModal ?? null,
+  }
+}
+
+function observationWhileDialogOpen(
+  runtime: DeviceRuntime,
+  dialog: AgentNativeDialogState,
+): PageObservation {
+  const previous = runtime.deviceRun.steps.at(-1)
+  return {
+    wait: previous?.wait ?? modalBlockedWait(dialog),
+    page: previous?.page ?? { url: '', title: '' },
+    snapshot: null,
+    snapshotMeta: null,
+    screenshotUrl: null,
+    dialog,
+    blockedModal: null,
+  }
+}
+
+async function inspectBrowserModal(
+  bridge: AgentCliBridge,
+  session: string,
+  triggerStepIndex: number,
+): Promise<Pick<PageObservation, 'dialog' | 'blockedModal'> | null> {
+  try {
+    const modal = await bridge.inspectModal(session)
+    if (!modal) return null
+    if (modal.kind === 'dialog') {
+      return { dialog: createOpenDialog(modal, triggerStepIndex), blockedModal: null }
+    }
+    if (modal.kind === 'fileChooser') {
+      return {
+        dialog: null,
+        blockedModal: {
+          type: 'fileChooser',
+          description: modal.description,
+          status: 'blocked',
+          triggerStepIndex,
+        },
+      }
+    }
+    return createUnsupportedModal(modal.description, triggerStepIndex)
+  } catch {
+    return null
+  }
+}
+
+function createOpenDialog(
+  dialog: Extract<CliModalState, { kind: 'dialog' }>,
+  triggerStepIndex: number,
+): AgentNativeDialogState {
+  return {
+    type: dialog.type,
+    message: dialog.message,
+    status: 'open',
+    action: null,
+    promptText: null,
+    triggerStepIndex,
+  }
+}
+
+function createUnsupportedModal(
+  description: string,
+  triggerStepIndex: number,
+): Pick<PageObservation, 'dialog' | 'blockedModal'> {
+  return {
+    dialog: null,
+    blockedModal: {
+      type: 'unsupported',
+      description,
+      status: 'blocked',
+      triggerStepIndex,
+    },
+  }
+}
+
+function modalBlockedWait(dialog: AgentNativeDialogState): AgentWaitResult {
+  const detail = `native_dialog:${dialog.type}`
+  return {
+    status: 'timed_out',
+    reason: 'observer_error',
+    elapsedMs: 0,
+    signals: {
+      navigation: { status: 'error', detail },
+      network: { status: 'error', detail },
+      dom: { status: 'error', detail },
+      fonts: { status: 'error', detail },
+      images: { status: 'error', detail },
+      paint: { status: 'error', detail },
+    },
+  }
+}
+
+function blockedModalError(modal: AgentBlockedModalState): string {
+  if (modal.type === 'fileChooser') {
+    return '检测到文件选择器，当前未配置自动上传文件'
+  }
+  return `检测到不支持的浏览器模态状态：${modal.description}`
+}
+
+function updateFailureCircuit(
+  runtime: DeviceRuntime,
+  report: ActionResultReport,
+): string | null {
+  if (report.ok) {
+    runtime.lastFailureFingerprint = null
+    runtime.consecutiveFailureCount = 0
+    return null
+  }
+  const error = normalizeFailureText(report.error ?? report.output)
+  const fingerprint = `${report.command.trim().toLowerCase()}\n${error}`
+  if (runtime.lastFailureFingerprint === fingerprint) runtime.consecutiveFailureCount += 1
+  else {
+    runtime.lastFailureFingerprint = fingerprint
+    runtime.consecutiveFailureCount = 1
+  }
+  if (runtime.consecutiveFailureCount < 3) return null
+  return `命令 ${report.command} 以相同原因连续失败 3 次：${report.error ?? report.output}`
+}
+
+function normalizeFailureText(value: string): string {
+  const ansiColorSequence = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
+  return value
+    .replace(ansiColorSequence, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
 }
 
 function appendStep(deps: DeviceAgentDeps, runtime: DeviceRuntime, step: DeviceAgentStep): void {
@@ -558,7 +865,51 @@ async function safeWaitForPageReady(
 }
 
 function supportsLocator(command: string): boolean {
-  return !['snapshot', 'find', 'goto', 'go-back', 'go-forward', 'reload', 'eval'].includes(command)
+  return ![
+    'snapshot',
+    'find',
+    'goto',
+    'go-back',
+    'go-forward',
+    'reload',
+    'eval',
+    'dialog-accept',
+    'dialog-dismiss',
+  ].includes(command)
+}
+
+function isDialogCommand(command: string): boolean {
+  return command === 'dialog-accept' || command === 'dialog-dismiss'
+}
+
+function validateDialogAction(
+  command: string,
+  args: string[],
+  pendingDialog: AgentNativeDialogState | null,
+): string | null {
+  if (pendingDialog && !isDialogCommand(command)) {
+    return `当前存在尚未处理的 ${pendingDialog.type} 原生弹窗，只能先调用 dialog-accept 或 dialog-dismiss`
+  }
+  if (!pendingDialog && isDialogCommand(command)) {
+    return '当前没有需要处理的浏览器原生弹窗'
+  }
+  if (command === 'dialog-dismiss' && args.length > 0) {
+    return 'dialog-dismiss 不接受参数'
+  }
+  if (command === 'dialog-accept' && args.length > 1) {
+    return 'dialog-accept 最多接受一个 prompt 输入文本参数'
+  }
+  return null
+}
+
+function waitContainsModalError(wait: AgentWaitResult | null | undefined): boolean {
+  if (!wait?.signals) return false
+  return Object.values(wait.signals).some((signal) => isCliModalStateError(signal.detail))
+}
+
+function formatDialogForModel(dialog: AgentNativeDialogState): string {
+  const message = dialog.message === null ? '文案不可用' : `文案“${dialog.message}”`
+  return `[浏览器原生弹窗] type=${dialog.type}，${message}，status=${dialog.status}。请调用 dialog-accept 或 dialog-dismiss 处理。`
 }
 
 function resultError(result: CliResult, fallback: string): string {

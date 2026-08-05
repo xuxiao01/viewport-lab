@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type {
+  AgentModelName,
   CaptureDelayMs,
   DeviceAgentRun,
+  OptimizeAgentTaskPromptResult,
   RerunScope,
   RunKind,
+  TaskPromptClarificationAnswer,
   TestConfiguration,
 } from '@viewport-lab/shared'
+import { agentTurnLimits, defaultAgentModel } from '@viewport-lab/shared'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -17,6 +21,7 @@ import CapturePanel from '../components/CapturePanel.vue'
 import CaptureProgress from '../components/CaptureProgress.vue'
 import ScreenshotHistory from '../components/ScreenshotHistory.vue'
 import ScreenshotViewer from '../components/ScreenshotViewer.vue'
+import TaskPromptOptimizerDialog from '../components/TaskPromptOptimizerDialog.vue'
 import {
   defaultSelectedPresetIds,
   getPlatformPresetIds,
@@ -37,7 +42,8 @@ const initialDraft = loadTaskDraft({
   url: 'http://localhost:5188',
   note: '',
   aiTaskDescription: '',
-  maxTurns: 50,
+  maxTurns: agentTurnLimits.default,
+  model: defaultAgentModel,
   captureDelayMs: 0,
   selectedCategories: ['ios-phone'],
   activeCategory: 'ios-phone',
@@ -48,6 +54,7 @@ const url = ref(initialDraft.url)
 const note = ref(initialDraft.note)
 const aiTaskDescription = ref(initialDraft.aiTaskDescription)
 const maxTurns = ref(initialDraft.maxTurns)
+const model = ref<AgentModelName>(initialDraft.model)
 const captureDelayMs = ref<CaptureDelayMs>(initialDraft.captureDelayMs)
 const selectedCategories = ref<PlatformId[]>([...initialDraft.selectedCategories])
 const activeCategory = ref<PlatformId | null>(initialDraft.activeCategory)
@@ -59,8 +66,10 @@ const selectedKind = ref<'viewport' | 'agent'>('viewport')
 const agentViewerVisible = ref(false)
 const agentStepViewerVisible = ref(false)
 const selectedAgentDevice = ref<DeviceAgentRun | null>(null)
+const promptOptimizerVisible = ref(false)
+const promptOptimizerResult = ref<OptimizeAgentTaskPromptResult | null>(null)
 const isAgentMode = computed(() => aiTaskDescription.value.trim().length > 0)
-const taskSubmitting = computed(() => store.creating || agentStore.creating)
+const taskSubmitting = computed(() => store.creating || agentStore.creating || agentStore.optimizing)
 const selectedViewportRunning = computed(
   () =>
     selectedKind.value === 'viewport' &&
@@ -73,6 +82,7 @@ watch(
     note,
     aiTaskDescription,
     maxTurns,
+    model,
     captureDelayMs,
     selectedCategories,
     activeCategory,
@@ -85,6 +95,7 @@ watch(
       note: note.value,
       aiTaskDescription: aiTaskDescription.value,
       maxTurns: maxTurns.value,
+      model: model.value,
       captureDelayMs: captureDelayMs.value,
       selectedCategories: [...selectedCategories.value],
       activeCategory: activeCategory.value,
@@ -122,6 +133,7 @@ async function startDetectionTask(): Promise<void> {
       note: note.value.trim(),
       selectedPresetIds: effectiveSelectedPresetIds.value,
       maxTurns: maxTurns.value,
+      model: model.value,
     })
     if (!run) {
       ElMessage.error(agentStore.error ?? '创建 Agent 运行失败')
@@ -152,11 +164,54 @@ async function startDetectionTask(): Promise<void> {
   }
 }
 
+async function requestTaskPromptOptimization(
+  clarifications: TaskPromptClarificationAnswer[] = [],
+): Promise<void> {
+  const result = await agentStore.optimizeTaskPrompt({
+    url: url.value.trim(),
+    note: note.value.trim(),
+    task: aiTaskDescription.value.trim(),
+    model: model.value,
+    clarifications,
+  })
+  if (!result) {
+    ElMessage.error(agentStore.promptOptimizationError ?? 'AI 任务描述优化失败')
+    return
+  }
+  promptOptimizerResult.value = result
+  promptOptimizerVisible.value = true
+}
+
+async function openTaskPromptOptimizer(): Promise<void> {
+  if (!agentStore.gatewayStatus?.configured) {
+    ElMessage.error(agentStore.gatewayStatus?.reason ?? 'AI 网关未配置')
+    return
+  }
+  await requestTaskPromptOptimization()
+}
+
+function applyOptimizedTask(optimizedTask: string): void {
+  aiTaskDescription.value = optimizedTask
+  promptOptimizerVisible.value = false
+  promptOptimizerResult.value = null
+  ElMessage.success('已应用优化后的 AI 任务描述')
+}
+
+function closeTaskPromptOptimizer(): void {
+  if (agentStore.optimizing) return
+  promptOptimizerVisible.value = false
+  promptOptimizerResult.value = null
+}
+
 function applyConfiguration(configuration: TestConfiguration): void {
   url.value = configuration.url
   note.value = configuration.note
   aiTaskDescription.value = configuration.kind === 'agent' ? configuration.task : ''
-  maxTurns.value = configuration.kind === 'agent' ? configuration.maxTurns : 50
+  maxTurns.value =
+    configuration.kind === 'agent'
+      ? normalizeAgentTurns(configuration.maxTurns)
+      : agentTurnLimits.default
+  model.value = configuration.kind === 'agent' ? configuration.model : defaultAgentModel
   captureDelayMs.value = configuration.kind === 'viewport' ? configuration.captureDelayMs : 0
 
   const platformIds = [...new Set(configuration.devices.map((device) => device.platformId))]
@@ -181,7 +236,8 @@ async function executeConfiguration(configuration: TestConfiguration): Promise<v
       task: configuration.task,
       note: configuration.note,
       devices: configuration.devices,
-      maxTurns: configuration.maxTurns,
+      maxTurns: normalizeAgentTurns(configuration.maxTurns),
+      model: configuration.model,
     })
     if (!run) {
       ElMessage.error(agentStore.error ?? '创建 Agent 运行失败')
@@ -216,6 +272,10 @@ function orderCategories(categoryIds: PlatformId[]): PlatformId[] {
   return viewportPresets
     .filter((platform) => categoryIds.includes(platform.id))
     .map((platform) => platform.id)
+}
+
+function normalizeAgentTurns(value: number): number {
+  return Math.min(agentTurnLimits.max, Math.max(agentTurnLimits.min, value))
 }
 
 function toggleCategory(platformId: PlatformId): void {
@@ -437,6 +497,7 @@ onMounted(async () => {
         :note="note"
         :ai-task-description="aiTaskDescription"
         :max-turns="maxTurns"
+        :model="model"
         :capture-delay-ms="captureDelayMs"
         :gateway-status="agentStore.gatewayStatus"
         :selected-categories="selectedCategories"
@@ -444,15 +505,27 @@ onMounted(async () => {
         :selected-preset-ids="selectedPresetIds"
         :platforms="viewportPresets"
         :running="taskSubmitting"
+        :optimizing="agentStore.optimizing"
         @update:url="url = $event"
         @update:note="note = $event"
         @update:ai-task-description="aiTaskDescription = $event"
         @update:max-turns="maxTurns = $event"
+        @update:model="model = $event"
         @update:capture-delay-ms="captureDelayMs = $event"
         @update:active-category="updateActiveCategory"
         @update:selected-preset-ids="selectedPresetIds = $event"
         @toggle-category="toggleCategory"
+        @optimize-task="openTaskPromptOptimizer"
         @start="startDetectionTask"
+      />
+      <TaskPromptOptimizerDialog
+        :visible="promptOptimizerVisible"
+        :result="promptOptimizerResult"
+        :loading="agentStore.optimizing"
+        @update:visible="promptOptimizerVisible = $event"
+        @submit-clarifications="requestTaskPromptOptimization"
+        @apply="applyOptimizedTask"
+        @close="closeTaskPromptOptimizer"
       />
       <CaptureProgress
         v-if="selectedKind === 'viewport'"

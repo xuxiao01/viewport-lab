@@ -16,6 +16,9 @@ const selectedStepIndex = ref(0)
 const selectedDevice = computed<DeviceAgentRun | null>(
   () => props.run?.deviceRuns.find((device) => device.deviceId === selectedDeviceId.value) ?? null,
 )
+const selectedDevicePreset = computed(
+  () => props.run?.devices.find((device) => device.selectionId === selectedDeviceId.value) ?? null,
+)
 const selectedStep = computed<DeviceAgentStep | null>(
   () =>
     selectedDevice.value?.steps.find((step) => step.stepIndex === selectedStepIndex.value) ?? null,
@@ -32,7 +35,11 @@ const visibleDevices = computed(() => {
 })
 
 watch(
-  () => [props.modelValue, props.initialDeviceId, props.run?.runId] as const,
+  [
+    () => props.modelValue,
+    () => props.initialDeviceId,
+    () => props.run?.runId,
+  ],
   () => {
     if (!props.modelValue || !props.run) return
     const requestedDevice = visibleDevices.value.find(
@@ -44,9 +51,13 @@ watch(
   { immediate: true },
 )
 
-watch(selectedDeviceId, () => {
-  selectedStepIndex.value = selectedDevice.value?.steps[0]?.stepIndex ?? 0
-})
+watch(
+  () => selectedDevice.value?.steps.map((step) => step.stepIndex) ?? [],
+  (stepIndexes) => {
+    if (stepIndexes.includes(selectedStepIndex.value)) return
+    selectedStepIndex.value = stepIndexes[0] ?? 0
+  },
+)
 
 const currentPosition = computed(
   () =>
@@ -58,6 +69,12 @@ function move(offset: number): void {
   const steps = selectedDevice.value?.steps ?? []
   const next = steps[currentPosition.value + offset]
   if (next) selectedStepIndex.value = next.stepIndex
+}
+
+function selectDevice(deviceId: string): void {
+  if (selectedDeviceId.value === deviceId) return
+  selectedDeviceId.value = deviceId
+  selectedStepIndex.value = selectedDevice.value?.steps[0]?.stepIndex ?? 0
 }
 
 function formatDuration(value: number): string {
@@ -81,6 +98,26 @@ function snapshotLabel(step: DeviceAgentStep): string {
   if (!meta.changed) return `未变化，与第 ${meta.sameAsStepIndex ?? 0} 步相同`
   return `${meta.returnedChars.toLocaleString()} / ${meta.originalChars.toLocaleString()} 字符${meta.truncated ? '（已达上限）' : ''}`
 }
+
+function dialogTypeLabel(type: NonNullable<DeviceAgentStep['dialog']>['type']): string {
+  return (
+    {
+      alert: 'Alert 提示',
+      confirm: 'Confirm 确认',
+      prompt: 'Prompt 输入',
+      beforeunload: '离开页面确认',
+      unknown: '未知原生弹窗',
+    } as const
+  )[type]
+}
+
+function dialogActionLabel(step: DeviceAgentStep): string {
+  const dialog = step.dialog
+  if (!dialog) return '—'
+  if (dialog.status === 'open') return '等待 Agent 处理'
+  if (dialog.action === 'dismiss') return '已取消'
+  return dialog.promptText === null ? '已接受' : `已输入“${dialog.promptText}”并接受`
+}
 </script>
 
 <template>
@@ -99,7 +136,7 @@ function snapshotLabel(step: DeviceAgentStep): string {
           :key="device.deviceId"
           type="button"
           :class="{ active: device.deviceId === selectedDeviceId }"
-          @click="selectedDeviceId = device.deviceId"
+          @click="selectDevice(device.deviceId)"
         >
           <span class="device-name">{{ device.presetName }}</span>
           <span class="device-role">{{ executionRole(device.deviceId) }}</span>
@@ -137,13 +174,23 @@ function snapshotLabel(step: DeviceAgentStep): string {
             <span>{{ formatDuration(selectedStep.durationMs) }}</span>
           </header>
 
-          <div class="step-image">
-            <img
-              v-if="selectedStep.screenshotUrl"
-              :src="selectedStep.screenshotUrl"
-              :alt="`第 ${selectedStep.stepIndex} 步截图`"
-            />
-            <div v-else class="image-empty">该步骤没有可用截图</div>
+          <div class="step-preview">
+            <div class="step-preview-meta">
+              <strong>步骤截图</strong>
+              <span v-if="selectedDevicePreset">
+                逻辑视口 {{ selectedDevicePreset.viewport.width }} ×
+                {{ selectedDevicePreset.viewport.height }}
+              </span>
+              <span v-if="selectedDevicePreset">DPR {{ selectedDevicePreset.deviceScaleFactor }}</span>
+            </div>
+            <div class="step-image">
+              <img
+                v-if="selectedStep.screenshotUrl"
+                :src="selectedStep.screenshotUrl"
+                :alt="`第 ${selectedStep.stepIndex} 步截图`"
+              />
+              <div v-else class="image-empty">该步骤没有可用截图</div>
+            </div>
           </div>
 
           <dl class="step-meta">
@@ -166,6 +213,51 @@ function snapshotLabel(step: DeviceAgentStep): string {
             <div v-if="selectedStep.output">
               <dt>工具输出</dt>
               <dd class="code-output">{{ selectedStep.output }}</dd>
+            </div>
+            <div v-if="selectedStep.dialog" class="dialog-state-row">
+              <dt>原生弹窗</dt>
+              <dd>
+                <span :class="['dialog-state', selectedStep.dialog.status]">
+                  {{ dialogTypeLabel(selectedStep.dialog.type) }} ·
+                  {{ dialogActionLabel(selectedStep) }}
+                </span>
+                <span v-if="selectedStep.dialog.message" class="dialog-message">
+                  {{ selectedStep.dialog.message }}
+                </span>
+              </dd>
+            </div>
+            <div v-if="selectedStep.blockedModal" class="dialog-state-row">
+              <dt>阻断的模态状态</dt>
+              <dd>
+                <span class="dialog-state open">
+                  {{
+                    selectedStep.blockedModal.type === 'fileChooser'
+                      ? '文件选择器'
+                      : '不支持的模态状态'
+                  }}
+                  · 当前设备已停止
+                </span>
+                <span class="dialog-message">{{ selectedStep.blockedModal.description }}</span>
+              </dd>
+            </div>
+            <div v-if="selectedStep.fileUpload" class="dialog-state-row">
+              <dt>文件上传</dt>
+              <dd>
+                <span
+                  :class="[
+                    'dialog-state',
+                    selectedStep.fileUpload.status === 'uploaded' ? 'handled' : 'open',
+                  ]"
+                >
+                  {{ selectedStep.fileUpload.status === 'uploaded' ? '已自动上传' : '上传失败' }}
+                </span>
+                <span class="dialog-message">
+                  {{ selectedStep.fileUpload.fileName }}
+                  <template v-if="selectedStep.fileUpload.error">
+                    · {{ selectedStep.fileUpload.error }}
+                  </template>
+                </span>
+              </dd>
             </div>
             <div v-if="selectedStep.wait">
               <dt>页面等待</dt>
@@ -328,10 +420,40 @@ em.failed {
 
 .step-detail {
   display: grid;
-  grid-template-rows: auto minmax(240px, 1fr) auto auto;
+  grid-template-rows: auto auto auto auto;
   gap: 12px;
   min-width: 0;
   padding: 16px;
+}
+
+.step-preview {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.step-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+}
+
+.step-preview-meta strong,
+.step-preview-meta span {
+  padding: 4px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+.step-preview-meta strong {
+  color: var(--color-text-strong);
+  background: var(--color-primary-soft);
+}
+
+.step-preview-meta span {
+  color: var(--color-text-secondary);
+  background: var(--color-surface-subtle);
 }
 
 .step-detail header,
@@ -349,9 +471,11 @@ em.failed {
 .step-image {
   display: flex;
   justify-content: center;
-  align-items: flex-start;
-  max-height: 48vh;
-  overflow: auto;
+  align-items: center;
+  width: 100%;
+  height: min(52vh, 620px);
+  min-height: 320px;
+  overflow: hidden;
   border: 1px solid var(--color-border);
   border-radius: 10px;
   background: #e9ebf0;
@@ -359,8 +483,11 @@ em.failed {
 
 .step-image img {
   display: block;
+  width: auto;
   max-width: 100%;
-  height: auto;
+  max-height: 100%;
+  object-fit: contain;
+  background: #fff;
 }
 
 .image-empty,
@@ -424,6 +551,30 @@ em.failed {
   color: var(--color-warning, #9a6700);
 }
 
+.dialog-state-row dd {
+  display: grid;
+  gap: 4px;
+}
+
+.dialog-state {
+  font-weight: 650;
+}
+
+.dialog-state.open {
+  color: var(--color-warning, #9a6700);
+}
+
+.dialog-state.handled {
+  color: var(--color-success);
+}
+
+.dialog-message {
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: var(--color-surface-subtle);
+  white-space: pre-wrap;
+}
+
 .step-detail footer {
   justify-content: flex-end;
 }
@@ -442,6 +593,11 @@ em.failed {
     max-height: 220px;
     border-right: 0;
     border-bottom: 1px solid var(--color-border);
+  }
+
+  .step-image {
+    height: min(58vh, 560px);
+    min-height: 280px;
   }
 }
 </style>

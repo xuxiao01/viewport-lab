@@ -1,3 +1,4 @@
+import type { AgentModelName } from './agent.js'
 import type { CaptureDelayMs, RunKind, ScreenshotDevicePresetSnapshot } from './index.js'
 
 interface TestConfigurationBase {
@@ -20,6 +21,7 @@ export interface AgentTestConfiguration extends TestConfigurationBase {
   kind: 'agent'
   task: string
   maxTurns: number
+  model: AgentModelName
 }
 
 export type TestConfiguration = ViewportTestConfiguration | AgentTestConfiguration

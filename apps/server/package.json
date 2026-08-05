@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp src/agent/prompts.md dist/agent/prompts.md",
     "test": "node --import tsx --test src/*.test.ts src/agent/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",

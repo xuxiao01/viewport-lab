@@ -24,3 +24,6 @@ playwright-report/
 
 # Local-only internal documentation
 local-doc/
+
+# Deployment-only font cache; the release script uploads it separately.
+.deploy-cache/

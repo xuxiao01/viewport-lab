@@ -9,6 +9,8 @@
   },
   "scripts": {
     "dev": "pnpm --filter @viewport-lab/shared build && concurrently -n web,server -c cyan,green \"pnpm --filter @viewport-lab/web dev\" \"pnpm --filter @viewport-lab/server dev\"",
+    "deploy:dev-machine": "bash scripts/deploy-dev-machine.sh",
+    "tunnel:dev-machine": "bash scripts/open-dev-machine-tunnel.sh",
     "build": "pnpm -r build",
     "typecheck": "pnpm --filter @viewport-lab/shared build && pnpm -r typecheck",
     "lint": "eslint .",

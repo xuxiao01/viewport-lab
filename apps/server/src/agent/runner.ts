@@ -1,10 +1,12 @@
 import type {
+  AgentModelName,
   AgentRun,
   AgentRunStatus,
   DeviceAgentRun,
   RerunScope,
   ScreenshotDevicePresetSnapshot,
 } from '@viewport-lab/shared'
+import { agentModelNames, agentTurnLimits, defaultAgentModel } from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import { createArchiveId } from '../run-archive.js'
 import { ConcurrencyScheduler } from '../task-scheduler.js'
@@ -32,7 +34,7 @@ const activeDeviceSessions = new Map<
   string,
   Map<string, { bridge: AgentCliBridge; session: string }>
 >()
-export const AGENT_DEVICE_CONCURRENCY = 5
+export const AGENT_DEVICE_CONCURRENCY = 2
 const agentDeviceScheduler = new ConcurrencyScheduler(AGENT_DEVICE_CONCURRENCY)
 
 export async function startAgentRun(params: {
@@ -41,16 +43,20 @@ export async function startAgentRun(params: {
   note: string
   devices: ScreenshotDevicePresetSnapshot[]
   maxTurns: number
+  model: AgentModelName
   emit: AgentEventSink
 }): Promise<AgentRun> {
-  const { url, task, note, devices, maxTurns, emit } = params
+  const { url, task, note, devices, maxTurns, model, emit } = params
   if (devices.length === 0) throw new Error('Agent run 至少需要一个设备预设')
-  if (maxTurns < 1 || maxTurns > 100) throw new Error('maxTurns 必须在 1 到 100 之间')
+  if (maxTurns < agentTurnLimits.min || maxTurns > agentTurnLimits.max) {
+    throw new Error(`maxTurns 必须在 ${agentTurnLimits.min} 到 ${agentTurnLimits.max} 之间`)
+  }
 
   const runId = createArchiveId()
   const persisted = await ensureRunDirs(runId)
   const createdAt = new Date().toISOString()
-  const gatewayConfig = readAgentGatewayConfig()
+  const baseGatewayConfig = readAgentGatewayConfig()
+  const gatewayConfig = baseGatewayConfig ? { ...baseGatewayConfig, model } : null
 
   const deviceRuns: DeviceAgentRun[] = devices.map((device) => ({
     deviceId: device.selectionId,
@@ -84,7 +90,7 @@ export async function startAgentRun(params: {
     url,
     task,
     note,
-    model: gatewayConfig?.model ?? null,
+    model,
     devices,
     maxTurns,
     deviceRuns,
@@ -150,7 +156,9 @@ export async function rerunAgentRunInPlace(params: {
     )
     const selectedIds = new Set(selectedDevices.map((device) => device.selectionId))
     const rerunAt = new Date().toISOString()
-    const gatewayConfig = readAgentGatewayConfig()
+    const selectedModel = normalizeAgentModel(sourceRun.model)
+    const baseGatewayConfig = readAgentGatewayConfig()
+    const gatewayConfig = baseGatewayConfig ? { ...baseGatewayConfig, model: selectedModel } : null
     const initialRun: AgentRun = {
       ...sourceRun,
       executionMode: 'per_device',
@@ -159,7 +167,7 @@ export async function rerunAgentRunInPlace(params: {
       rerunAt,
       completedAt: null,
       status: 'queued',
-      model: gatewayConfig?.model ?? sourceRun.model,
+      model: selectedModel,
       deviceRuns: sourceRun.deviceRuns.map((deviceRun) =>
         selectedIds.has(deviceRun.deviceId)
           ? {
@@ -198,6 +206,7 @@ export async function rerunAgentRunInPlace(params: {
           recorder,
           devices: sourceRun.devices,
           captureDeviceIds: selectedIds,
+          ...(scope === 'list' ? { clearRerunListAfterCompletion: selectedIds } : {}),
           url: sourceRun.url,
           task: sourceRun.task,
           maxTurns: sourceRun.maxTurns,
@@ -229,6 +238,12 @@ export async function rerunAgentRunInPlace(params: {
   }
 }
 
+function normalizeAgentModel(model: string | null): AgentModelName {
+  return typeof model === 'string' && agentModelNames.includes(model as AgentModelName)
+    ? (model as AgentModelName)
+    : defaultAgentModel
+}
+
 export function selectRerunDevices(
   sourceRun: AgentRun,
   scope: RerunScope,
@@ -247,6 +262,7 @@ async function runAllDevices(params: {
   recorder: AgentRunRecorder
   devices: ScreenshotDevicePresetSnapshot[]
   captureDeviceIds?: ReadonlySet<string>
+  clearRerunListAfterCompletion?: ReadonlySet<string>
   url: string
   task: string
   maxTurns: number
@@ -335,7 +351,16 @@ async function runAllDevices(params: {
   await persistQueue
   const now = new Date().toISOString()
   const wasCancelled = cancelledRunIds.has(runId)
+  if (!wasCancelled && params.clearRerunListAfterCompletion) {
+    recorder.update({
+      rerunDeviceIds: removeCompletedRerunListDevices(
+        recorder.run.rerunDeviceIds,
+        params.clearRerunListAfterCompletion,
+      ),
+    })
+  }
   const allCompleted = recorder.run.deviceRuns.every((dr) => dr.status === 'completed')
+  const anyPartial = recorder.run.deviceRuns.some((dr) => dr.status === 'partial')
   const anyFailed = recorder.run.deviceRuns.some((dr) => dr.status === 'failed')
   const batchStatus: AgentRunStatus = wasCancelled
     ? 'cancelled'
@@ -343,11 +368,21 @@ async function runAllDevices(params: {
       ? 'completed'
       : anyFailed
         ? 'failed'
+        : anyPartial
+          ? 'partial'
         : 'completed'
   recorder.setStatus(batchStatus)
   recorder.update({ completedAt: now, durationMs: Date.now() - executionStartedAt })
   await recorder.persist()
   emit({ type: 'status', run: recorder.run })
+}
+
+/** A completed manual-list rerun consumes only the devices it actually ran. */
+export function removeCompletedRerunListDevices(
+  rerunDeviceIds: readonly string[],
+  completedDeviceIds: ReadonlySet<string>,
+): string[] {
+  return rerunDeviceIds.filter((deviceId) => !completedDeviceIds.has(deviceId))
 }
 
 export async function cancelAgentRun(runId: string): Promise<void> {

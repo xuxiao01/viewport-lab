@@ -20,20 +20,26 @@ import type {
   RetryRun,
   RetryScreenshot,
   ScreenshotDevicePresetSnapshot,
+  OptimizeAgentTaskPromptRequest,
+  OptimizeAgentTaskPromptResponse,
   UpdateAgentRerunListRequest,
   UpdateAgentRerunListResponse,
   UpdateRunNoteRequest,
 } from '@viewport-lab/shared'
 import {
+  agentModelNames,
+  agentTurnLimits,
+  defaultAgentModel,
   batchNoteMaxLength,
   captureDelayValues,
   screenshotLimits,
   screenshotPlatformIds,
+  taskPromptOptimizationLimits,
 } from '@viewport-lab/shared'
 import type { AgentEvent } from '@viewport-lab/shared'
 import type { FastifyInstance } from 'fastify'
 
-import { agentGatewayStatus, agentOutputsDir, agentRunsDir } from './config.js'
+import { agentGatewayStatus, agentOutputsDir, agentRunsDir, readAgentGatewayConfig } from './config.js'
 import {
   ensureRetryDeviceDir,
   listAgentRuns,
@@ -48,6 +54,7 @@ import {
 } from './recorder.js'
 import { cancelAgentRun, rerunAgentRunInPlace, startAgentRun } from './runner.js'
 import type { AgentEventSink } from './runner.js'
+import { optimizeAgentTaskPrompt } from './task-prompt-optimizer.js'
 
 type Subscriber = (event: AgentEvent) => void
 const subscribers = new Map<string, Set<Subscriber>>()
@@ -167,7 +174,7 @@ function toRunSummary(run: AgentRun): AgentRunSummary {
 function parseCreateAgentRunRequest(body: unknown): CreateAgentRunRequest | null {
   if (typeof body !== 'object' || body === null) return null
   const value = body as Record<string, unknown>
-  const { url, task, note, devices, maxTurns } = value
+  const { url, task, note, devices, maxTurns, model } = value
   if (
     typeof url !== 'string' ||
     !isHttpUrl(url) ||
@@ -180,8 +187,11 @@ function parseCreateAgentRunRequest(body: unknown): CreateAgentRunRequest | null
     devices.length > 20 ||
     typeof maxTurns !== 'number' ||
     !Number.isInteger(maxTurns) ||
-    maxTurns < 1 ||
-    maxTurns > 100
+    maxTurns < agentTurnLimits.min ||
+    maxTurns > agentTurnLimits.max ||
+    (model !== undefined &&
+      (typeof model !== 'string' ||
+        !agentModelNames.includes(model as (typeof agentModelNames)[number])))
   ) {
     return null
   }
@@ -199,10 +209,59 @@ function parseCreateAgentRunRequest(body: unknown): CreateAgentRunRequest | null
     note: note.trim(),
     devices: validDevices,
     maxTurns,
+    model: (model ?? defaultAgentModel) as CreateAgentRunRequest['model'],
   }
 }
 
-const terminalStatuses = new Set(['completed', 'failed', 'cancelled'])
+function parseOptimizeAgentTaskPromptRequest(body: unknown): OptimizeAgentTaskPromptRequest | null {
+  if (!isRecord(body)) return null
+  const { url, note, task, model, clarifications } = body
+  if (
+    typeof url !== 'string' ||
+    !isHttpUrl(url) ||
+    typeof note !== 'string' ||
+    note.trim().length > batchNoteMaxLength ||
+    typeof task !== 'string' ||
+    task.trim().length === 0 ||
+    task.trim().length > taskPromptOptimizationLimits.taskMaxLength ||
+    typeof model !== 'string' ||
+    !agentModelNames.includes(model as (typeof agentModelNames)[number]) ||
+    !Array.isArray(clarifications) ||
+    clarifications.length > taskPromptOptimizationLimits.clarificationMaxCount
+  ) {
+    return null
+  }
+  const parsedClarifications = clarifications.map((clarification) => {
+    if (!isRecord(clarification)) return null
+    if (typeof clarification.question !== 'string' || typeof clarification.answer !== 'string') {
+      return null
+    }
+    const question = clarification.question.trim()
+    const answer = clarification.answer.trim()
+    if (
+      question.length === 0 ||
+      answer.length === 0 ||
+      question.length > taskPromptOptimizationLimits.clarificationTextMaxLength ||
+      answer.length > taskPromptOptimizationLimits.clarificationTextMaxLength
+    ) {
+      return null
+    }
+    return { question, answer }
+  })
+  if (parsedClarifications.some((clarification) => clarification === null)) return null
+  return {
+    url: url.trim(),
+    note: note.trim(),
+    task: task.trim(),
+    model: model as OptimizeAgentTaskPromptRequest['model'],
+    clarifications: parsedClarifications.filter(
+      (clarification): clarification is OptimizeAgentTaskPromptRequest['clarifications'][number] =>
+        clarification !== null,
+    ),
+  }
+}
+
+const terminalStatuses = new Set(['completed', 'partial', 'failed', 'cancelled'])
 
 function isRunTerminal(run: AgentRun): boolean {
   return terminalStatuses.has(run.status)
@@ -353,6 +412,24 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
     agentGatewayStatus(),
   )
 
+  app.post<{
+    Body: unknown
+    Reply: OptimizeAgentTaskPromptResponse | { error: string }
+  }>('/api/agent/task-prompt-optimizer', async (request, reply) => {
+    const parsed = parseOptimizeAgentTaskPromptRequest(request.body)
+    if (!parsed) return reply.code(400).send({ error: 'Invalid task prompt optimization request' })
+    const gatewayConfig = readAgentGatewayConfig()
+    if (!gatewayConfig) return reply.code(503).send({ error: 'AI 网关未配置' })
+    try {
+      const result = await optimizeAgentTaskPrompt(gatewayConfig, parsed)
+      return reply.send({ result })
+    } catch (error) {
+      return reply
+        .code(502)
+        .send({ error: error instanceof Error ? error.message : 'AI 任务描述优化失败' })
+    }
+  })
+
   app.get<{ Reply: ListAgentRunsResponse }>('/api/agent/runs', async () => ({
     runs: (await listAgentRuns()).map(toRunSummary),
   }))
@@ -394,6 +471,7 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         note: parsed.note,
         devices: parsed.devices,
         maxTurns: parsed.maxTurns,
+        model: parsed.model,
         emit,
       })
       return reply.code(201).send({ run })

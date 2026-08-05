@@ -110,7 +110,8 @@ export class AgentRunRecorder {
   }
 
   setStatus(status: AgentRunStatus, error: string | null = null): void {
-    const terminal = status === 'completed' || status === 'failed' || status === 'cancelled'
+    const terminal =
+      status === 'completed' || status === 'partial' || status === 'failed' || status === 'cancelled'
     this.update({
       status,
       error,
@@ -141,7 +142,9 @@ export class AgentRunRecorder {
     this.updateDeviceRun(deviceId, {
       status,
       error,
-      ...(status === 'completed' || status === 'failed' || status === 'cancelled' ? {} : {}),
+      ...(status === 'completed' || status === 'partial' || status === 'failed' || status === 'cancelled'
+        ? {}
+        : {}),
     })
   }
 
@@ -240,6 +243,9 @@ export function normalizeAgentRun(run: AgentRun): AgentRun {
       page: step.page ?? null,
       snapshotMeta: step.snapshotMeta ?? null,
       replayLocator: step.replayLocator ?? null,
+      dialog: step.dialog ?? null,
+      blockedModal: step.blockedModal ?? null,
+      fileUpload: step.fileUpload ?? null,
     })),
     replaySteps: Array.isArray(deviceRun.replaySteps) ? deviceRun.replaySteps : [],
     viewportMetrics: deviceRun.viewportMetrics
@@ -279,7 +285,7 @@ export async function listAgentRuns(): Promise<AgentRun[]> {
 export async function normalizeInterruptedAgentRuns(): Promise<void> {
   const interruptedAt = nowIso()
   for (const run of await listAgentRuns()) {
-    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue
+    if (run.status === 'completed' || run.status === 'partial' || run.status === 'failed' || run.status === 'cancelled') continue
     const recorder = new AgentRunRecorder(await ensureRunDirs(run.runId), {
       ...run,
       status: 'failed',
@@ -292,6 +298,7 @@ export async function normalizeInterruptedAgentRuns(): Promise<void> {
       ),
       deviceRuns: run.deviceRuns.map((deviceRun) =>
         deviceRun.status === 'completed' ||
+        deviceRun.status === 'partial' ||
         deviceRun.status === 'failed' ||
         deviceRun.status === 'cancelled'
           ? deviceRun

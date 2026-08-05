@@ -4,10 +4,14 @@ import test from 'node:test'
 import type { AgentRun, DeviceAgentRun, ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 
 import { normalizeAgentRun } from './recorder.js'
-import { AGENT_DEVICE_CONCURRENCY, selectRerunDevices } from './runner.js'
+import {
+  AGENT_DEVICE_CONCURRENCY,
+  removeCompletedRerunListDevices,
+  selectRerunDevices,
+} from './runner.js'
 
-test('limits the global Agent device pool to five independent Agents', () => {
-  assert.equal(AGENT_DEVICE_CONCURRENCY, 5)
+test('limits the global Agent device pool to two independent Agents', () => {
+  assert.equal(AGENT_DEVICE_CONCURRENCY, 2)
 })
 
 test('normalizes legacy manifests as independent per-device Agent runs', () => {
@@ -47,6 +51,7 @@ test('normalizes missing page observation fields in legacy steps', () => {
   assert.equal(step?.wait, null)
   assert.equal(step?.page, null)
   assert.equal(step?.snapshotMeta, null)
+  assert.equal(step?.dialog, null)
 })
 
 test('keeps the single-agent resize execution mode and its configured leader', () => {
@@ -80,6 +85,16 @@ test('keeps rerun device ordering while retaining the original leader separately
   )
   assert.deepEqual(
     selectRerunDevices(run, 'failed').map((device) => device.selectionId),
+    ['device-b'],
+  )
+})
+
+test('removes only completed manual-list devices after a list rerun settles', () => {
+  assert.deepEqual(
+    removeCompletedRerunListDevices(
+      ['device-a', 'device-b', 'device-c'],
+      new Set(['device-a', 'device-c']),
+    ),
     ['device-b'],
   )
 })

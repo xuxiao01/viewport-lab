@@ -6,7 +6,12 @@ import test from 'node:test'
 
 import type { ScreenshotDevicePresetSnapshot } from '@viewport-lab/shared'
 
-import type { AgentCliBridge, AgentViewportOptions, CliResult } from './cli-bridge.js'
+import type {
+  AgentCliBridge,
+  AgentViewportOptions,
+  CliModalState,
+  CliResult,
+} from './cli-bridge.js'
 import type { DeviceAgentArtifacts } from './device-agent.js'
 import { runDeviceAgent } from './device-agent.js'
 import type { ActionResultReport, DeviceLlmClient, NextActionResult } from './llm-client.js'
@@ -35,17 +40,28 @@ function device(
 class FakeLlmClient implements DeviceLlmClient {
   readonly reports: ActionResultReport[] = []
   nextActionCalls = 0
+  retryNextActionCalls = 0
 
   constructor(
     private readonly actions: NextActionResult[],
     private readonly transientFailures = 0,
+    private readonly transientError = 'AI 网关调用失败：429 Too Many Requests',
   ) {}
 
   async nextAction(): Promise<NextActionResult> {
     this.nextActionCalls += 1
     if (this.nextActionCalls <= this.transientFailures) {
-      throw new Error('AI 网关调用失败：429 Too Many Requests')
+      throw new Error(this.transientError)
     }
+    const action = this.actions.shift()
+    if (!action) throw new Error('测试没有配置下一步动作')
+    return action
+  }
+
+  async retryNextAction(): Promise<NextActionResult> {
+    this.retryNextActionCalls += 1
+    this.nextActionCalls += 1
+    if (this.nextActionCalls <= this.transientFailures) throw new Error(this.transientError)
     const action = this.actions.shift()
     if (!action) throw new Error('测试没有配置下一步动作')
     return action
@@ -64,6 +80,15 @@ class FakeCliBridge implements AgentCliBridge {
   readonly closeCalls: string[] = []
   snapshotOutputs: string[] = []
   failCommand: string | null = null
+  modalAfterCommand: string | null = null
+  modalToOpen: CliModalState = {
+    kind: 'dialog',
+    type: 'confirm',
+    message: '确定提交课程吗？',
+  }
+  modalState: CliModalState | null = null
+  failUpload = false
+  screenshotCalls: string[] = []
 
   async open(session: string, options: AgentViewportOptions): Promise<CliResult> {
     this.openCalls.push({ session, options })
@@ -71,10 +96,13 @@ class FakeCliBridge implements AgentCliBridge {
   }
 
   async snapshot(): Promise<CliResult> {
+    if (this.modalState) return modalError('browser_snapshot')
     return success(this.snapshotOutputs.shift() ?? '- button "继续" [ref=f1e2]')
   }
 
   async screenshot(_session: string, filename: string): Promise<CliResult> {
+    this.screenshotCalls.push(filename)
+    if (this.modalState) return modalError('browser_take_screenshot')
     const pngHeader = Buffer.alloc(24)
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(pngHeader)
     Buffer.from('IHDR').copy(pngHeader, 12)
@@ -89,6 +117,7 @@ class FakeCliBridge implements AgentCliBridge {
   }
 
   async runCode(_session: string, code: string): Promise<CliResult> {
+    if (this.modalState) return modalError('browser_run_code')
     if (code.includes('preparedAt')) {
       return success(
         JSON.stringify({ url: 'https://example.com', title: 'Example', preparedAt: Date.now() }),
@@ -131,8 +160,31 @@ class FakeCliBridge implements AgentCliBridge {
     )
   }
 
+  async inspectModal(): Promise<CliModalState | null> {
+    return this.modalState
+  }
+
   async execute(session: string, command: string, args: string[]): Promise<CliResult> {
     this.executeCalls.push({ session, command, args: [...args] })
+    if (command === 'upload') {
+      if (this.failUpload) return { ok: false, output: '', error: 'upload failed' }
+      if (!this.modalState || this.modalState.kind !== 'fileChooser') {
+        return { ok: false, output: '', error: 'No file chooser visible' }
+      }
+      this.modalState = null
+      return success('uploaded')
+    }
+    if (command === 'dialog-accept' || command === 'dialog-dismiss') {
+      if (!this.modalState || this.modalState.kind !== 'dialog') {
+        return { ok: false, output: '', error: 'No dialog visible' }
+      }
+      this.modalState = null
+      return success(`${command} completed`)
+    }
+    if (command === this.modalAfterCommand) {
+      this.modalState = this.modalToOpen
+      this.modalAfterCommand = null
+    }
     if (command === this.failCommand) return { ok: false, output: '', error: 'action failed' }
     return success(`${command} completed`)
   }
@@ -205,6 +257,135 @@ test('reports failed actions to the same device Agent so it can recover', async 
   })
 })
 
+test('reports a native dialog and lets the same Agent explicitly accept it', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    const llm = new FakeLlmClient([
+      action('click', ['f1']),
+      action('dialog-accept', []),
+      done(),
+    ])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.deepEqual(run.steps[1]?.dialog, {
+      type: 'confirm',
+      message: '确定提交课程吗？',
+      status: 'open',
+      action: null,
+      promptText: null,
+      triggerStepIndex: 1,
+    })
+    assert.equal(run.steps[1]?.screenshotUrl, null)
+    assert.equal(run.steps[2]?.dialog?.status, 'handled')
+    assert.equal(run.steps[2]?.dialog?.action, 'accept')
+    assert.equal(llm.reports[0]?.dialog?.status, 'open')
+    assert.equal(llm.reports[1]?.dialog?.status, 'handled')
+    assert.ok(bridge.screenshotCalls.length >= 2)
+  })
+})
+
+test('does not let the Agent finish while a native dialog is still open', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    const llm = new FakeLlmClient([
+      action('click', ['f1']),
+      done(),
+      action('dialog-dismiss', []),
+      done(),
+    ])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.equal(llm.reports[1]?.command, 'finish')
+    assert.equal(llm.reports[1]?.ok, false)
+    assert.match(llm.reports[1]?.error ?? '', /尚未处理/)
+    assert.equal(run.steps[2]?.dialog?.action, 'dismiss')
+  })
+})
+
+test('treats a timed-out command as triggered when it opened a native dialog', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'reload'
+    bridge.modalToOpen = { kind: 'dialog', type: 'beforeunload', message: '' }
+    bridge.failCommand = 'reload'
+    const llm = new FakeLlmClient([
+      action('reload', []),
+      action('dialog-dismiss', []),
+      done(),
+    ])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.steps[1]?.status, 'success')
+    assert.equal(run.steps[1]?.dialog?.type, 'beforeunload')
+    assert.match(run.steps[1]?.output ?? '', /等待 Agent 处理/)
+  })
+})
+
+test('supports prompt text when accepting a native prompt dialog', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    bridge.modalToOpen = { kind: 'dialog', type: 'prompt', message: '请输入学生姓名' }
+    const llm = new FakeLlmClient([
+      action('click', ['f1']),
+      action('dialog-accept', ['小雨点']),
+      done(),
+    ])
+    const runPromise = execute(device(), artifacts, bridge, llm)
+    const run = await runPromise
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.steps[2]?.dialog?.promptText, '小雨点')
+    assert.deepEqual(
+      bridge.executeCalls.find((call) => call.command === 'dialog-accept')?.args,
+      ['小雨点'],
+    )
+  })
+})
+
+test('reports a dialog command as failed when there is no native dialog', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    const llm = new FakeLlmClient([action('dialog-accept', []), done()])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.steps[1]?.status, 'failed')
+    assert.match(run.steps[1]?.error ?? '', /没有需要处理/)
+    assert.equal(
+      bridge.executeCalls.some((call) => call.command === 'dialog-accept'),
+      false,
+    )
+  })
+})
+
+test('blocks regular page commands until the open native dialog is handled', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    const llm = new FakeLlmClient([
+      action('click', ['f1']),
+      action('press', ['Enter']),
+      action('dialog-dismiss', []),
+      done(),
+    ])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.steps[2]?.status, 'failed')
+    assert.match(run.steps[2]?.error ?? '', /只能先调用/)
+    assert.equal(
+      bridge.executeCalls.some((call) => call.command === 'press'),
+      false,
+    )
+  })
+})
+
 test('retries temporary gateway throttling without sharing another device conversation', async () => {
   await withArtifacts(async (artifacts) => {
     const bridge = new FakeCliBridge()
@@ -212,17 +393,110 @@ test('retries temporary gateway throttling without sharing another device conver
     const run = await execute(device(), artifacts, bridge, llm, { gatewayRetryDelayMs: 0 })
 
     assert.equal(llm.nextActionCalls, 3)
+    assert.equal(llm.retryNextActionCalls, 2)
     assert.equal(run.status, 'completed')
   })
 })
 
-test('a device that reaches max turns fails but still keeps diagnostic evidence', async () => {
+test('does not retry quota or token-limit gateway errors', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    const llm = new FakeLlmClient(
+      [done()],
+      10,
+      'AI 网关调用失败：429 You exceeded your current quota, please check your plan and billing details. token-limit',
+    )
+    const run = await execute(device(), artifacts, bridge, llm, { gatewayRetryDelayMs: 0 })
+
+    assert.equal(run.status, 'failed')
+    assert.equal(llm.nextActionCalls, 1)
+    assert.equal(llm.retryNextActionCalls, 0)
+    assert.match(run.error ?? '', /current quota/)
+  })
+})
+
+test('uploads the default fixture and continues when a file chooser is detected', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    bridge.modalToOpen = { kind: 'fileChooser', description: 'File chooser' }
+    const llm = new FakeLlmClient([action('click', ['f1']), done()])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'completed')
+    assert.equal(run.steps[1]?.blockedModal, null)
+    assert.equal(run.steps[1]?.dialog, null)
+    assert.deepEqual(run.steps[1]?.fileUpload, {
+      fileName: 'default-photo.png',
+      status: 'uploaded',
+      error: null,
+    })
+    assert.equal(llm.reports.length, 1)
+    assert.equal(llm.nextActionCalls, 2)
+    const uploadCall = bridge.executeCalls.find((call) => call.command === 'upload')
+    assert.match(uploadCall?.args[0] ?? '', /fixtures\/agent-upload\/default-photo\.png$/)
+  })
+})
+
+test('stops a device when automatic default image upload fails', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    bridge.modalToOpen = { kind: 'fileChooser', description: 'File chooser' }
+    bridge.failUpload = true
+    const llm = new FakeLlmClient([action('click', ['f1']), done()])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'failed')
+    assert.match(run.error ?? '', /自动上传默认测试图片失败/)
+    assert.equal(run.steps[1]?.blockedModal?.type, 'fileChooser')
+    assert.equal(run.steps[1]?.fileUpload?.status, 'failed')
+    assert.equal(llm.reports.length, 0)
+  })
+})
+
+test('stops a device immediately for an unsupported modal without creating an unknown dialog', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.modalAfterCommand = 'click'
+    bridge.modalToOpen = { kind: 'unsupported', description: 'Download prompt' }
+    const llm = new FakeLlmClient([action('click', ['f1']), done()])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'failed')
+    assert.match(run.error ?? '', /不支持的浏览器模态状态/)
+    assert.equal(run.steps[1]?.blockedModal?.type, 'unsupported')
+    assert.equal(run.steps[1]?.dialog, null)
+    assert.equal(llm.reports.length, 0)
+  })
+})
+
+test('stops a device after the same command and error fail three times consecutively', async () => {
+  await withArtifacts(async (artifacts) => {
+    const bridge = new FakeCliBridge()
+    bridge.failCommand = 'click'
+    const llm = new FakeLlmClient([
+      action('click', ['f1']),
+      action('click', ['f1']),
+      action('click', ['f1']),
+      done(),
+    ])
+    const run = await execute(device(), artifacts, bridge, llm)
+
+    assert.equal(run.status, 'failed')
+    assert.match(run.error ?? '', /连续失败 3 次/)
+    assert.equal(run.steps.filter((step) => step.command === 'click').length, 3)
+    assert.equal(llm.reports.length, 2)
+  })
+})
+
+test('a device that reaches max turns ends partially but still keeps diagnostic evidence', async () => {
   await withArtifacts(async (artifacts) => {
     const bridge = new FakeCliBridge()
     const llm = new FakeLlmClient([action('click', ['f1'])])
     const run = await execute(device(), artifacts, bridge, llm, { maxTurns: 1 })
 
-    assert.equal(run.status, 'failed')
+    assert.equal(run.status, 'partial')
     assert.match(run.error ?? '', /最大轮数/)
     assert.ok(run.finalScreenshotUrl)
     assert.equal(bridge.closeCalls.length, 1)
@@ -251,6 +525,14 @@ function done(): NextActionResult {
 
 function success(output: string): CliResult {
   return { ok: true, output, error: null }
+}
+
+function modalError(tool: string): CliResult {
+  return {
+    ok: false,
+    output: '',
+    error: `Error: Tool "${tool}" does not handle the modal state.`,
+  }
 }
 
 async function execute(

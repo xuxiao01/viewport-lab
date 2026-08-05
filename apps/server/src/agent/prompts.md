@@ -24,6 +24,15 @@
 - snapshot：显式刷新页面观察。系统已在每次命令后自动返回快照，通常不需要调用。
 - find <text>：在快照中搜索文本。
 - eval <func>：执行 JS 表达式。
+- dialog-accept [promptText]：接受当前浏览器原生弹窗；prompt 弹窗可传入输入文本。
+- dialog-dismiss：取消当前浏览器原生弹窗。
+
+## 浏览器原生弹窗
+
+- JavaScript `alert`、`confirm`、`prompt` 和 `beforeunload` 会以 `dialog` 字段返回类型和文案，它们不是页面 DOM 弹窗。
+- 存在 `status=open` 的原生弹窗时，只能调用 `dialog-accept` 或 `dialog-dismiss`，处理前不要调用 snapshot、截图或其他页面命令。
+- `alert` 通常使用 `dialog-accept`；`confirm` 根据用户任务选择接受或取消；`prompt` 可用 `dialog-accept` 的第一个参数填写文本；`beforeunload` 根据是否继续离开当前页面决定。
+- 不得在原生弹窗尚未处理时调用 finish。
 
 ## ref 体系
 

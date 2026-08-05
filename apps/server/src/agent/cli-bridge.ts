@@ -7,12 +7,26 @@ import { fileURLToPath } from 'node:url'
 const rootDir = resolve(fileURLToPath(new URL('../../../../', import.meta.url)))
 const DEFAULT_BINARY = resolve(rootDir, 'apps/server/node_modules/.bin/playwright-cli')
 const DEFAULT_CWD = resolve(rootDir, 'apps/server')
+export const DEFAULT_AGENT_UPLOAD_PATH = resolve(
+  rootDir,
+  'fixtures/agent-upload/default-photo.png',
+)
+export const DEFAULT_AGENT_UPLOAD_FILE_NAME = 'default-photo.png'
 
 export interface CliResult {
   ok: boolean
   output: string
   error: string | null
 }
+
+export type CliModalState =
+  | {
+      kind: 'dialog'
+      type: 'alert' | 'confirm' | 'prompt' | 'beforeunload'
+      message: string | null
+    }
+  | { kind: 'fileChooser'; description: string }
+  | { kind: 'unsupported'; description: string }
 
 export interface AgentViewportOptions {
   width: number
@@ -28,6 +42,7 @@ export interface AgentCliBridge {
   screenshot(session: string, filename: string): Promise<CliResult>
   generateLocator(session: string, ref: string): Promise<CliResult>
   runCode(session: string, code: string): Promise<CliResult>
+  inspectModal(session: string): Promise<CliModalState | null>
   execute(session: string, command: string, args: string[]): Promise<CliResult>
   close(session: string): Promise<CliResult>
 }
@@ -58,6 +73,9 @@ const ALLOWED_COMMANDS = new Set([
   'snapshot',
   'find',
   'eval',
+  'dialog-accept',
+  'dialog-dismiss',
+  'upload',
 ])
 
 class ConcreteCliBridge implements AgentCliBridge {
@@ -109,6 +127,12 @@ class ConcreteCliBridge implements AgentCliBridge {
 
   async runCode(session: string, code: string): Promise<CliResult> {
     return this.exec(session, 'run-code', [code])
+  }
+
+  async inspectModal(session: string): Promise<CliModalState | null> {
+    const fullArgs = session === '__no_session__' ? ['snapshot'] : [`-s=${session}`, 'snapshot']
+    const output = await this.execText(fullArgs, DEFAULT_TIMEOUT)
+    return parseCliModalState(output)
   }
 
   async execute(session: string, command: string, args: string[]): Promise<CliResult> {
@@ -196,6 +220,48 @@ class ConcreteCliBridge implements AgentCliBridge {
       )
     })
   }
+
+  private execText(fullArgs: string[], timeout: number): Promise<string> {
+    return new Promise((resolvePromise) => {
+      execFile(
+        this.binary,
+        fullArgs,
+        { cwd: this.cwd, timeout, maxBuffer: 20 * 1024 * 1024 },
+        (_error, stdout, stderr) => {
+          resolvePromise(`${stdout || ''}${stderr ? `\n${stderr}` : ''}`.trim())
+        },
+      )
+    })
+  }
+}
+
+export function isCliModalStateError(value: string | null | undefined): boolean {
+  return typeof value === 'string' && /does not handle the modal state/i.test(value)
+}
+
+export function parseCliModalState(output: string): CliModalState | null {
+  const dialogMatch = output.match(
+    /- \["(alert|confirm|prompt|beforeunload)" dialog with message "([\s\S]*?)"\]: can be handled by /,
+  )
+  if (dialogMatch) {
+    return {
+      kind: 'dialog',
+      type: dialogMatch[1] as Extract<CliModalState, { kind: 'dialog' }>['type'],
+      message: dialogMatch[2] ?? null,
+    }
+  }
+
+  const fileChooserMatch = output.match(/- \[(File chooser[^\]]*)\]: can be handled by upload/i)
+  if (fileChooserMatch) {
+    return { kind: 'fileChooser', description: fileChooserMatch[1] ?? 'File chooser' }
+  }
+
+  const modalSection = output.match(/### Modal state\s*\n([\s\S]*?)(?:\n### |$)/i)
+  if (modalSection) {
+    const description = modalSection[1]?.trim() || '未知浏览器模态状态'
+    return { kind: 'unsupported', description }
+  }
+  return null
 }
 
 export function sanitizeSessionId(raw: string): string {

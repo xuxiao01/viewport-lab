@@ -58,6 +58,8 @@ const ALLOWED_CLI_COMMANDS = [
   'snapshot',
   'find',
   'eval',
+  'dialog-accept',
+  'dialog-dismiss',
 ] as const
 
 export interface ToolDefinition {
@@ -87,7 +89,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           args: {
             type: 'array',
             items: { type: 'string' },
-            description: 'CLI 位置参数，如 ["f1e25"] 或 ["f1e25", "搜索文本"]。goto 命令传 URL。',
+            description:
+              'CLI 位置参数，如 ["f1e25"] 或 ["f1e25", "搜索文本"]。goto 命令传 URL；dialog-accept 可传一个 prompt 输入文本，dialog-dismiss 不传参数。',
           },
           purpose: {
             type: 'string',

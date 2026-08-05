@@ -155,6 +155,7 @@ function historyStatus(item: UnifiedHistoryItem): string {
   if (item.kind === 'viewport') return item.summary.status
   if (item.summary.status === 'queued') return 'queued'
   if (item.summary.status === 'completed') return 'completed'
+  if (item.summary.status === 'partial') return 'partial'
   if (item.summary.status === 'failed' || item.summary.status === 'cancelled') return 'failed'
   return 'running'
 }
@@ -163,6 +164,7 @@ function historyStatusLabel(item: UnifiedHistoryItem): string {
   if (item.kind === 'viewport') return statusLabels[item.summary.status]
   if (item.summary.status === 'queued') return '等待中'
   if (item.summary.status === 'completed') return '成功'
+  if (item.summary.status === 'partial') return '已结束（轮次上限）'
   if (item.summary.status === 'failed' || item.summary.status === 'cancelled') return '异常'
   return '进行中'
 }
@@ -311,7 +313,7 @@ function confirmAgentRerun(): void {
 }
 
 const terminalBatchStatuses = new Set<BatchStatus>(['completed', 'partial_failed', 'failed'])
-const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed', 'cancelled'])
+const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'partial', 'failed', 'cancelled'])
 </script>
 
 <template>
@@ -534,6 +536,8 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
                   {{
                     agentRun.status === 'completed'
                       ? '成功'
+                      : agentRun.status === 'partial'
+                        ? '已结束（轮次上限）'
                       : agentRun.status === 'failed'
                         ? '异常'
                         : '运行中'
@@ -611,7 +615,7 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
                 <button
                   type="button"
                   class="delete-button"
-                  :disabled="!['completed', 'failed', 'cancelled'].includes(agentRun.status)"
+                  :disabled="!['completed', 'partial', 'failed', 'cancelled'].includes(agentRun.status)"
                   @click="confirmDeleteAgent"
                 >
                   删除批次
@@ -1063,6 +1067,11 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'failed'
 .status-badge.completed {
   color: var(--color-success);
   background: var(--color-success-soft);
+}
+
+.status-badge.partial {
+  color: var(--color-warning);
+  background: var(--color-warning-soft);
 }
 
 .status-badge.partial_failed,

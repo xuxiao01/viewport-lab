@@ -3,7 +3,14 @@ import type { Dirent } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { batchNoteMaxLength, terminalAgentRunStatuses } from '@viewport-lab/shared'
+import {
+  agentModelNames,
+  agentTurnLimits,
+  batchNoteMaxLength,
+  defaultAgentModel,
+  terminalAgentRunStatuses,
+} from '@viewport-lab/shared'
+import type { AgentModelName } from '@viewport-lab/shared'
 import type {
   AgentRun,
   ApiErrorResponse,
@@ -122,11 +129,22 @@ async function readConfiguration(configId: string): Promise<TestConfiguration | 
         (typeof configuration.task !== 'string' ||
           !Number.isInteger(configuration.maxTurns) ||
           configuration.maxTurns < 1 ||
-          configuration.maxTurns > 100))
+          configuration.maxTurns > agentTurnLimits.max ||
+          (configuration.model !== undefined &&
+            !agentModelNames.includes(configuration.model as AgentModelName))))
     ) {
       return null
     }
-    return configuration
+    return configuration.kind === 'agent'
+      ? {
+          ...configuration,
+          model:
+            typeof configuration.model === 'string' &&
+            agentModelNames.includes(configuration.model as AgentModelName)
+              ? (configuration.model as AgentModelName)
+              : defaultAgentModel,
+        }
+      : configuration
   } catch {
     return null
   }
@@ -225,6 +243,11 @@ async function saveConfiguration(
             kind: 'agent',
             task: source.task,
             maxTurns: source.maxTurns,
+            model:
+              typeof source.model === 'string' &&
+              agentModelNames.includes(source.model as AgentModelName)
+                ? (source.model as AgentModelName)
+                : defaultAgentModel,
           }
 
     await mkdir(configurationsDir, { recursive: true })

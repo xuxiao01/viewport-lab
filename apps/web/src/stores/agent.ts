@@ -9,6 +9,9 @@ import type {
   DeviceAgentRun,
   GetAgentRunResponse,
   ListAgentRunsResponse,
+  OptimizeAgentTaskPromptRequest,
+  OptimizeAgentTaskPromptResponse,
+  OptimizeAgentTaskPromptResult,
   RerunAgentRunResponse,
   RerunScope,
   ScreenshotDevicePresetSnapshot,
@@ -20,7 +23,7 @@ import { computed, ref } from 'vue'
 import { getPresetSelectionId, viewportPresets } from '../config/viewport-presets'
 import type { PlatformId, ViewportPreset } from '../types/capture'
 
-const terminalStatuses = new Set<AgentRun['status']>(['completed', 'failed', 'cancelled'])
+const terminalStatuses = new Set<AgentRun['status']>(['completed', 'partial', 'failed', 'cancelled'])
 
 function toRunSummary(run: AgentRun): AgentRunSummary {
   return {
@@ -74,19 +77,23 @@ export const useAgentStore = defineStore('agent', () => {
   const detailLoading = ref(false)
   const creating = ref(false)
   const rerunning = ref(false)
+  const optimizing = ref(false)
+  const promptOptimizationError = ref<string | null>(null)
   const rerunListUpdatingDeviceId = ref<string | null>(null)
   const error = ref<string | null>(null)
   const eventSources = new Map<string, EventSource>()
   const activeRerunDeviceIds = new Map<string, Set<string>>()
 
-  const isRunning = computed(
-    () => runHistory.value.some((run) => !terminalStatuses.has(run.status)),
+  const isRunning = computed(() =>
+    runHistory.value.some((run) => !terminalStatuses.has(run.status)),
   )
 
   const deviceRuns = computed<DeviceAgentRun[]>(() => currentRun.value?.deviceRuns ?? [])
   const completedDeviceCount = computed(
     () =>
-      deviceRuns.value.filter((dr) => dr.status === 'completed' || dr.status === 'failed').length,
+      deviceRuns.value.filter(
+        (dr) => dr.status === 'completed' || dr.status === 'partial' || dr.status === 'failed',
+      ).length,
   )
 
   async function readApiError(response: Response, fallback: string): Promise<string> {
@@ -270,6 +277,7 @@ export const useAgentStore = defineStore('agent', () => {
     note: string
     selectedPresetIds: string[]
     maxTurns: number
+    model: CreateAgentRunRequest['model']
   }): Promise<AgentRun | null> {
     creating.value = true
     error.value = null
@@ -291,6 +299,7 @@ export const useAgentStore = defineStore('agent', () => {
         note: params.note.trim(),
         devices,
         maxTurns: params.maxTurns,
+        model: params.model,
       }
       return await submitRun(payload)
     } catch (err) {
@@ -298,6 +307,29 @@ export const useAgentStore = defineStore('agent', () => {
       return null
     } finally {
       creating.value = false
+    }
+  }
+
+  async function optimizeTaskPrompt(
+    payload: OptimizeAgentTaskPromptRequest,
+  ): Promise<OptimizeAgentTaskPromptResult | null> {
+    optimizing.value = true
+    promptOptimizationError.value = null
+    try {
+      const response = await fetch('/api/agent/task-prompt-optimizer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) {
+        throw new Error(await readApiError(response, 'AI 任务描述优化失败'))
+      }
+      return ((await response.json()) as OptimizeAgentTaskPromptResponse).result
+    } catch (err) {
+      promptOptimizationError.value = err instanceof Error ? err.message : 'AI 任务描述优化失败'
+      return null
+    } finally {
+      optimizing.value = false
     }
   }
 
@@ -415,6 +447,8 @@ export const useAgentStore = defineStore('agent', () => {
     detailLoading,
     creating,
     rerunning,
+    optimizing,
+    promptOptimizationError,
     rerunListUpdatingDeviceId,
     error,
     isRunning,
@@ -424,6 +458,7 @@ export const useAgentStore = defineStore('agent', () => {
     loadHistory,
     selectRun,
     createRun,
+    optimizeTaskPrompt,
     createRunFromSnapshots,
     rerunRun,
     updateRerunList,

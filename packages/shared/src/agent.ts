@@ -1,5 +1,10 @@
 import type { RerunScope, ScreenshotDevicePresetSnapshot, ScreenshotPlatformId } from './index.js'
 
+export const agentModelNames = ['deepseek-v4-flash-0731', 'deepseek-v4-pro'] as const
+export type AgentModelName = (typeof agentModelNames)[number]
+export const defaultAgentModel: AgentModelName = 'deepseek-v4-flash-0731'
+export const agentTurnLimits = { min: 100, max: 200, default: 150 } as const
+
 export const agentRunStatuses = [
   'queued',
   'launching',
@@ -8,6 +13,7 @@ export const agentRunStatuses = [
   'executing',
   'capturing',
   'completed',
+  'partial',
   'failed',
   'cancelled',
 ] as const
@@ -25,6 +31,7 @@ export type AgentExecutionMode = (typeof agentExecutionModes)[number]
 
 export const terminalAgentRunStatuses = new Set<AgentRunStatus>([
   'completed',
+  'partial',
   'failed',
   'cancelled',
 ])
@@ -105,11 +112,7 @@ export const agentReplayLocatorMethods = [
 
 export type AgentReplayLocatorMethod = (typeof agentReplayLocatorMethods)[number]
 export type AgentReplayLocatorValue =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: AgentReplayLocatorValue }
+  string | number | boolean | null | { [key: string]: AgentReplayLocatorValue }
 
 export interface AgentReplayLocatorCall {
   method: AgentReplayLocatorMethod
@@ -150,6 +153,39 @@ export interface AgentScreenshotPixelSize {
   height: number
 }
 
+export type AgentNativeDialogType =
+  | 'alert'
+  | 'confirm'
+  | 'prompt'
+  | 'beforeunload'
+  | 'unknown'
+
+export type AgentNativeDialogAction = 'accept' | 'dismiss' | null
+
+export interface AgentNativeDialogState {
+  type: AgentNativeDialogType
+  message: string | null
+  status: 'open' | 'handled'
+  action: AgentNativeDialogAction
+  promptText: string | null
+  triggerStepIndex: number | null
+}
+
+export type AgentBlockedModalType = 'fileChooser' | 'unsupported'
+
+export interface AgentBlockedModalState {
+  type: AgentBlockedModalType
+  description: string
+  status: 'blocked'
+  triggerStepIndex: number | null
+}
+
+export interface AgentFileUploadState {
+  fileName: string
+  status: 'uploaded' | 'failed'
+  error: string | null
+}
+
 export interface DeviceAgentStep {
   stepIndex: number
   command: string
@@ -166,6 +202,9 @@ export interface DeviceAgentStep {
   screenshotUrl: string | null
   locator: string | null
   replayLocator: AgentReplayLocator | null
+  dialog?: AgentNativeDialogState | null
+  blockedModal?: AgentBlockedModalState | null
+  fileUpload?: AgentFileUploadState | null
   startedAt: string
   completedAt: string
   durationMs: number
@@ -237,6 +276,7 @@ export interface CreateAgentRunRequest {
   note: string
   devices: ScreenshotDevicePresetSnapshot[]
   maxTurns: number
+  model: AgentModelName
 }
 
 export interface CreateAgentRunResponse {
@@ -274,6 +314,55 @@ export interface AgentGatewayStatus {
   model: string | null
   vhost: string | null
   reason: string | null
+}
+
+export const taskPromptOptimizationLimits = {
+  taskMaxLength: 12_000,
+  clarificationMaxCount: 3,
+  clarificationTextMaxLength: 1_000,
+  optionMaxCount: 4,
+} as const
+
+export interface TaskPromptClarificationOption {
+  id: string
+  label: string
+}
+
+export interface TaskPromptClarificationQuestion {
+  id: string
+  question: string
+  options: TaskPromptClarificationOption[]
+}
+
+export interface TaskPromptClarificationAnswer {
+  question: string
+  answer: string
+}
+
+export interface OptimizeAgentTaskPromptRequest {
+  url: string
+  note: string
+  task: string
+  model: AgentModelName
+  clarifications: TaskPromptClarificationAnswer[]
+}
+
+export interface TaskPromptNeedsClarificationResult {
+  status: 'needs_clarification'
+  questions: TaskPromptClarificationQuestion[]
+}
+
+export interface TaskPromptReadyResult {
+  status: 'ready'
+  optimizedTask: string
+}
+
+export type OptimizeAgentTaskPromptResult =
+  | TaskPromptNeedsClarificationResult
+  | TaskPromptReadyResult
+
+export interface OptimizeAgentTaskPromptResponse {
+  result: OptimizeAgentTaskPromptResult
 }
 
 export interface RetryScreenshot {

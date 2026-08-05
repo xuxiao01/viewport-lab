@@ -1,4 +1,10 @@
-import type { CaptureDelayMs } from '@viewport-lab/shared'
+import {
+  agentModelNames,
+  agentTurnLimits,
+  defaultAgentModel,
+  type AgentModelName,
+  type CaptureDelayMs,
+} from '@viewport-lab/shared'
 
 import { getPlatformPresetIds, viewportPresets } from '../config/viewport-presets'
 import type { PlatformId } from '../types/capture'
@@ -10,6 +16,7 @@ export interface TaskDraft {
   note: string
   aiTaskDescription: string
   maxTurns: number
+  model: AgentModelName
   captureDelayMs: CaptureDelayMs
   selectedCategories: PlatformId[]
   activeCategory: PlatformId | null
@@ -87,10 +94,14 @@ export function loadTaskDraft(fallback: TaskDraft): TaskDraft {
     maxTurns:
       typeof parsed.maxTurns === 'number' &&
       Number.isInteger(parsed.maxTurns) &&
-      parsed.maxTurns >= 1 &&
-      parsed.maxTurns <= 100
+      parsed.maxTurns >= agentTurnLimits.min &&
+      parsed.maxTurns <= agentTurnLimits.max
         ? parsed.maxTurns
         : fallback.maxTurns,
+    model:
+      typeof parsed.model === 'string' && agentModelNames.includes(parsed.model as AgentModelName)
+        ? (parsed.model as AgentModelName)
+        : (fallback.model ?? defaultAgentModel),
     captureDelayMs:
       parsed.captureDelayMs === 0 || parsed.captureDelayMs === 30_000
         ? parsed.captureDelayMs

@@ -19,7 +19,7 @@ Viewport Lab 是一个本地运行的全栈工具，用于在多种手机、平�
 - 内置苹果手机、苹果平板、安卓手机和安卓平板四类平台，共 17 个设备视口。
 - 支持平台、设备预设多选，并保存视口、DPR、移动端和触摸属性快照。
 - 普通截图提供默认模式和额外等待 30 秒模式。
-- Agent 支持 1～100 最大轮数设置：主设备完成探索后，会在同一页面会话中切换各逻辑视口保存最终图。
+- Agent 支持 100～200 最大轮数设置，默认 150 轮。
 - Agent 通过兼容 OpenAI 协议的 AI 网关生成 Playwright CLI 操作。
 - Agent 结果保存最终截图，并支持查看每一步的命令、目的、状态、输出和截图。
 - 普通截图和 Agent 统一进入截图历史，按时间展示运行状态和设备结果。
@@ -124,6 +124,7 @@ viewport-lab/
 - Node.js `>= 22.12.0`
 - pnpm `10.x`，根目录声明版本为 `10.13.1`
 - Playwright Chromium
+- Linux 开发机部署需要 `fontconfig`；部署脚本会先在本机缓存 Noto Sans CJK SC 与 Noto Color Emoji，再上传并在项目私有目录启用它们，无需 sudo 安装系统字体
 - Agent 模式需要可访问的兼容 OpenAI 协议的 AI 网关
 
 仓库提供 `.nvmrc`，使用 Node.js `22.14.0`。
@@ -139,7 +140,7 @@ pnpm install
 ### 2. 安装 Chromium
 
 ```bash
-pnpm --filter @viewport-lab/server exec playwright install chromium
+pnpm --filter @viewport-lab/server exec playwright-cli install-browser chromium
 ```
 
 ### 3. 创建本地环境变量
@@ -174,7 +175,7 @@ Vite 使用 `0.0.0.0` 监听，因此启动日志可能同时显示 localhost �
 | `AGENT_GATEWAY_API_URL`    | 无                      | AI 网关的 OpenAI 兼容 API 地址        |
 | `AGENT_GATEWAY_API_KEY`    | 无                      | AI 网关分配的内部 API Key             |
 | `AGENT_GATEWAY_VHOST`      | 空字符串                | 网关租户隔离使用的 Virtual Host       |
-| `AGENT_GATEWAY_MODEL`      | `deepseek-v4-flash`     | Agent 使用的模型名称                  |
+| `AGENT_GATEWAY_MODEL`      | `deepseek-v4-flash-0731` | Agent 使用的模型名称                  |
 | `AGENT_GATEWAY_TIMEOUT_MS` | `120000`                | 单次模型请求超时时间，单位毫秒        |
 
 `.env` 已被 Git 忽略。不要将 API Key 或其他凭证写入 README、代码、运行 manifest 或配置清单。
