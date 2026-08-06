@@ -11,13 +11,6 @@ const route = useRoute()
         创建检测任务
       </router-link>
       <router-link
-        to="/font-check"
-        class="app-tab"
-        :class="{ active: route.name === 'font-check' }"
-      >
-        字体检查
-      </router-link>
-      <router-link
         to="/configurations"
         class="app-tab"
         :class="{ active: route.name === 'configurations' }"

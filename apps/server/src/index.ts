@@ -36,7 +36,6 @@ import type { Page } from 'playwright'
 
 import { registerAgent } from './agent/index.js'
 import { normalizeInterruptedAgentRuns } from './agent/recorder.js'
-import { registerFontCheck } from './font-check.js'
 import { archiveIdPattern, createArchiveId } from './run-archive.js'
 import { SerialBatchScheduler } from './task-scheduler.js'
 import { registerTestConfigurationRoutes } from './test-configurations.js'
@@ -728,7 +727,6 @@ await mkdir(runsDir, { recursive: true })
 await normalizeInterruptedBatches()
 await normalizeInterruptedAgentRuns()
 await app.register(fastifyStatic, { root: runsDir, prefix: '/outputs/' })
-await registerFontCheck(app)
 await registerAgent(app)
 await registerTestConfigurationRoutes(app)
 

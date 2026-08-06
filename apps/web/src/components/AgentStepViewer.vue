@@ -71,6 +71,38 @@ function move(offset: number): void {
   if (next) selectedStepIndex.value = next.stepIndex
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest('input, textarea, select, [contenteditable], [role="textbox"]') !== null
+  )
+}
+
+function handleStepNavigation(event: KeyboardEvent): void {
+  if (
+    event.defaultPrevented ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    isEditableTarget(event.target)
+  ) {
+    return
+  }
+  const offset = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
+  if (!offset) return
+  event.preventDefault()
+  move(offset)
+}
+
+watch(
+  () => props.modelValue,
+  (isOpen, _wasOpen, onCleanup) => {
+    if (!isOpen) return
+    window.addEventListener('keydown', handleStepNavigation)
+    onCleanup(() => window.removeEventListener('keydown', handleStepNavigation))
+  },
+)
+
 function selectDevice(deviceId: string): void {
   if (selectedDeviceId.value === deviceId) return
   selectedDeviceId.value = deviceId
@@ -124,7 +156,8 @@ function dialogActionLabel(step: DeviceAgentStep): string {
   <el-dialog
     :model-value="modelValue"
     title="Agent 每步运行"
-    width="min(1180px, 94vw)"
+    class="agent-step-viewer-dialog"
+    width="calc(100vw - 48px)"
     destroy-on-close
     append-to-body
     @update:model-value="$emit('update:modelValue', $event)"
@@ -301,9 +334,29 @@ function dialogActionLabel(step: DeviceAgentStep): string {
 </template>
 
 <style scoped>
+:global(.agent-step-viewer-dialog) {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  height: calc(100vh - 48px);
+  max-width: none;
+  margin: 24px auto !important;
+  top: 0 !important;
+}
+
+:global(.agent-step-viewer-dialog .el-dialog__body) {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .step-viewer {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 14px;
+  width: 100%;
+  min-height: 0;
 }
 
 .device-tabs {
@@ -350,14 +403,14 @@ function dialogActionLabel(step: DeviceAgentStep): string {
 .step-layout {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
-  min-height: 620px;
+  min-height: 0;
   overflow: hidden;
   border: 1px solid var(--color-border);
   border-radius: 12px;
 }
 
 .step-timeline {
-  max-height: 72vh;
+  min-height: 0;
   overflow-y: auto;
   border-right: 1px solid var(--color-border);
   background: var(--color-surface-subtle);
@@ -424,6 +477,7 @@ em.failed {
   gap: 12px;
   min-width: 0;
   padding: 16px;
+  overflow-y: auto;
 }
 
 .step-preview {
@@ -585,6 +639,11 @@ em.failed {
 }
 
 @media (max-width: 800px) {
+  :global(.agent-step-viewer-dialog) {
+    height: calc(100vh - 24px);
+    margin: 12px auto !important;
+  }
+
   .step-layout {
     grid-template-columns: 1fr;
   }
