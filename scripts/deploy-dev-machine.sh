@@ -201,7 +201,6 @@ rsync \
   --exclude='.cursor/' \
   --exclude='.playwright-cli/' \
   --exclude='node_modules/' \
-  --exclude='dist/' \
   --exclude='.vite/' \
   --exclude='.env' \
   --exclude='data/' \

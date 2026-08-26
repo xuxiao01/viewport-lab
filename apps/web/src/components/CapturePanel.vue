@@ -15,6 +15,7 @@ const props = defineProps<{
   maxTurns: number
   model: AgentModelName
   captureDelayMs: CaptureDelayMs
+  landscape: boolean
   gatewayStatus: AgentGatewayStatus | null
   selectedCategories: PlatformId[]
   activeCategory: PlatformId | null
@@ -31,6 +32,7 @@ const emit = defineEmits<{
   'update:maxTurns': [value: number]
   'update:model': [value: AgentModelName]
   'update:captureDelayMs': [value: CaptureDelayMs]
+  'update:landscape': [value: boolean]
   'update:activeCategory': [value: PlatformId]
   'update:selectedPresetIds': [value: string[]]
   toggleCategory: [platformId: PlatformId]
@@ -54,6 +56,15 @@ const isValidUrl = computed(() => {
   try {
     const url = new URL(props.url)
     return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+})
+
+const isLoopbackUrl = computed(() => {
+  try {
+    const hostname = new URL(props.url).hostname.toLowerCase()
+    return ['localhost', 'localhost.', '127.0.0.1', '[::1]'].includes(hostname)
   } catch {
     return false
   }
@@ -122,6 +133,10 @@ function updateModel(value: string): void {
       @keyup.enter="canStart && emit('start')"
     />
     <p v-if="url && !isValidUrl" class="field-error">请输入有效的 HTTP 或 HTTPS URL</p>
+    <p v-else-if="isLoopbackUrl" class="local-target-hint">
+      将自动访问当前电脑的本地项目；请确保项目监听 0.0.0.0，例如使用
+      <code>pnpm dev -- --host 0.0.0.0</code>。
+    </p>
 
     <label class="field-label spaced-label" for="batch-note">任务标题 / 备注（可选）</label>
     <el-input
@@ -235,6 +250,35 @@ function updateModel(value: string): void {
       </div>
     </template>
 
+    <div class="orientation-row">
+      <div>
+        <strong>屏幕方向</strong>
+        <span>统一应用到本次任务的所有设备</span>
+      </div>
+      <div class="orientation-options" role="group" aria-label="屏幕方向">
+        <button
+          type="button"
+          :class="{ active: !landscape }"
+          :aria-pressed="!landscape"
+          :disabled="running"
+          @click="emit('update:landscape', false)"
+        >
+          <span class="orientation-icon portrait" aria-hidden="true"></span>
+          竖屏
+        </button>
+        <button
+          type="button"
+          :class="{ active: landscape }"
+          :aria-pressed="landscape"
+          :disabled="running"
+          @click="emit('update:landscape', true)"
+        >
+          <span class="orientation-icon landscape" aria-hidden="true"></span>
+          横屏
+        </button>
+      </div>
+    </div>
+
     <div class="platform-heading">
       <strong>选择平台</strong>
       <span>支持多选，执行所选平台下已勾选的预设</span>
@@ -315,6 +359,85 @@ function updateModel(value: string): void {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.orientation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface-subtle);
+}
+
+.orientation-row > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.orientation-row strong {
+  color: var(--color-text-strong);
+  font-size: 13px;
+}
+
+.orientation-row span {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.orientation-options {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.orientation-options button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-text-secondary);
+  background: #fff;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.orientation-options button:hover:not(:disabled) {
+  border-color: var(--color-primary-border);
+  color: var(--color-primary-dark);
+}
+
+.orientation-options button.active {
+  border-color: var(--color-primary);
+  color: var(--color-primary-dark);
+  background: var(--color-primary-soft);
+}
+
+.orientation-options button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.orientation-icon {
+  display: block;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+
+.orientation-icon.portrait {
+  width: 8px;
+  height: 12px;
+}
+
+.orientation-icon.landscape {
+  width: 12px;
+  height: 8px;
 }
 
 .agent-settings {
@@ -443,6 +566,17 @@ function updateModel(value: string): void {
   margin-top: 15px;
 }
 
+.local-target-hint {
+  margin: 8px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.local-target-hint code {
+  color: var(--color-text-secondary);
+}
+
 .ai-task-label-row {
   display: flex;
   align-items: center;
@@ -534,6 +668,16 @@ function updateModel(value: string): void {
 
   .capture-modes {
     grid-template-columns: 1fr;
+  }
+
+  .orientation-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .orientation-options button {
+    justify-content: center;
+    flex: 1;
   }
 
   .mode-heading span {

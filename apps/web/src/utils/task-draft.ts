@@ -18,6 +18,7 @@ export interface TaskDraft {
   maxTurns: number
   model: AgentModelName
   captureDelayMs: CaptureDelayMs
+  landscape: boolean
   selectedCategories: PlatformId[]
   activeCategory: PlatformId | null
   selectedPresetIds: string[]
@@ -106,6 +107,7 @@ export function loadTaskDraft(fallback: TaskDraft): TaskDraft {
       parsed.captureDelayMs === 0 || parsed.captureDelayMs === 30_000
         ? parsed.captureDelayMs
         : fallback.captureDelayMs,
+    landscape: typeof parsed.landscape === 'boolean' ? parsed.landscape : fallback.landscape,
     selectedCategories,
     activeCategory,
     selectedPresetIds: validPresets(parsed.selectedPresetIds, fallback.selectedPresetIds),

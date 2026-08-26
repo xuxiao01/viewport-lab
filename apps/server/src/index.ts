@@ -36,6 +36,7 @@ import type { Browser, Page } from 'playwright'
 
 import { registerAgent } from './agent/index.js'
 import { normalizeInterruptedAgentRuns } from './agent/recorder.js'
+import { resolveClientTargetUrl } from './client-target-url.js'
 import { archiveIdPattern, createArchiveId } from './run-archive.js'
 import { SerialBatchScheduler } from './task-scheduler.js'
 import { registerTestConfigurationRoutes } from './test-configurations.js'
@@ -53,7 +54,7 @@ const host = process.env.SERVER_HOST ?? '127.0.0.1'
 const portValue = Number(process.env.SERVER_PORT ?? 3001)
 const port = Number.isInteger(portValue) && portValue > 0 ? portValue : 3001
 
-const app = Fastify({ logger: true })
+const app = Fastify({ logger: true, trustProxy: true })
 const runs = new Map<string, RunManifest>()
 const batches = new Map<string, BatchManifest>()
 const batchWriteQueues = new Map<string, Promise<void>>()
@@ -801,6 +802,7 @@ app.post<{ Body: unknown; Reply: CreateBatchResponse | ApiErrorResponse }>(
   async (request, reply) => {
     const parsed = parseCreateBatchRequest(request.body)
     if (!parsed) return reply.code(400).send({ error: 'Invalid screenshot batch request' })
+    const targetUrl = resolveClientTargetUrl(parsed.url, request.ip)
 
     const createdAt = new Date()
     const now = createdAt.toISOString()
@@ -822,7 +824,7 @@ app.post<{ Body: unknown; Reply: CreateBatchResponse | ApiErrorResponse }>(
       createdAt: now,
       updatedAt: now,
       completedAt: null,
-      url: parsed.url,
+      url: targetUrl,
       note: parsed.note,
       captureDelayMs: parsed.captureDelayMs,
       status: 'queued',
@@ -938,7 +940,15 @@ app.post<{
         }
       : device,
   )
-  const updated = aggregateBatch({ ...batch, devices, completedAt: null }, rerunAt)
+  const updated = aggregateBatch(
+    {
+      ...batch,
+      url: resolveClientTargetUrl(batch.url, request.ip),
+      devices,
+      completedAt: null,
+    },
+    rerunAt,
+  )
   batches.set(batchId, updated)
   await persistBatch(updated)
 

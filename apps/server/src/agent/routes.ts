@@ -39,6 +39,7 @@ import {
 import type { AgentEvent } from '@viewport-lab/shared'
 import type { FastifyInstance } from 'fastify'
 
+import { resolveClientTargetUrl } from '../client-target-url.js'
 import { agentGatewayStatus, agentOutputsDir, agentRunsDir, readAgentGatewayConfig } from './config.js'
 import {
   ensureRetryDeviceDir,
@@ -466,7 +467,7 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: 'Invalid agent run request' })
       }
       const run = await startAgentRun({
-        url: parsed.url,
+        url: resolveClientTargetUrl(parsed.url, request.ip),
         task: parsed.task,
         note: parsed.note,
         devices: parsed.devices,
@@ -519,7 +520,14 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: '运行中的 Agent 批次不能重跑' })
     }
     try {
-      const result = await rerunAgentRunInPlace({ sourceRun, scope, emit })
+      const result = await rerunAgentRunInPlace({
+        sourceRun: {
+          ...sourceRun,
+          url: resolveClientTargetUrl(sourceRun.url, request.ip),
+        },
+        scope,
+        emit,
+      })
       return reply.send(result)
     } catch (error) {
       return reply

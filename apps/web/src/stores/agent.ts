@@ -20,7 +20,11 @@ import type {
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
-import { getPresetSelectionId, viewportPresets } from '../config/viewport-presets'
+import {
+  getPresetSelectionId,
+  orientViewportPreset,
+  viewportPresets,
+} from '../config/viewport-presets'
 import type { PlatformId, ViewportPreset } from '../types/capture'
 
 const terminalStatuses = new Set<AgentRun['status']>(['completed', 'partial', 'failed', 'cancelled'])
@@ -50,15 +54,17 @@ function buildDeviceSnapshot(
   platformId: PlatformId,
   preset: ViewportPreset,
   captureDelayMs: CaptureDelayMs = 0,
+  landscape = false,
 ): ScreenshotDevicePresetSnapshot {
   const platform = viewportPresets.find((item) => item.id === platformId)
+  const orientedPreset = orientViewportPreset(preset, landscape)
   return {
     selectionId: getPresetSelectionId(platformId, preset.id),
     platformId,
     platformName: platform?.name ?? platformId,
     presetId: preset.id,
-    presetName: preset.name,
-    viewport: { ...preset.viewport },
+    presetName: orientedPreset.name,
+    viewport: { ...orientedPreset.viewport },
     deviceScaleFactor: preset.deviceScaleFactor,
     isMobile: preset.isMobile,
     hasTouch: preset.hasTouch,
@@ -279,6 +285,7 @@ export const useAgentStore = defineStore('agent', () => {
     task: string
     note: string
     selectedPresetIds: string[]
+    landscape?: boolean
     maxTurns: number
     model: CreateAgentRunRequest['model']
   }): Promise<AgentRun | null> {
@@ -291,7 +298,7 @@ export const useAgentStore = defineStore('agent', () => {
         for (const preset of platform.presets) {
           const selectionId = getPresetSelectionId(platform.id, preset.id)
           if (selectedIds.has(selectionId)) {
-            devices.push(buildDeviceSnapshot(platform.id, preset))
+            devices.push(buildDeviceSnapshot(platform.id, preset, 0, params.landscape ?? false))
           }
         }
       }

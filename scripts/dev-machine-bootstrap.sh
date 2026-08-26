@@ -95,7 +95,16 @@ ln -s "$REMOTE_ROOT/config/.env" "$RELEASE_DIR/.env"
 
 cd "$RELEASE_DIR"
 pnpm install --frozen-lockfile
-pnpm build
+for build_artifact in \
+  packages/shared/dist/index.js \
+  apps/server/dist/index.js \
+  apps/server/dist/agent/prompts.js \
+  apps/web/dist/index.html; do
+  if [[ ! -f "$build_artifact" ]]; then
+    echo "候选 release 缺少本机构建产物：$build_artifact" >&2
+    exit 1
+  fi
+done
 node --input-type=module -e 'await import("./apps/server/dist/agent/prompts.js")'
 pnpm --filter @viewport-lab/server exec playwright-cli install-browser chromium
 

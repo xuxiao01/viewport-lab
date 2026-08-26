@@ -21,7 +21,11 @@ import type {
 import { acceptHMRUpdate, defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
-import { getPresetSelectionId, viewportPresets } from '../config/viewport-presets'
+import {
+  getPresetSelectionId,
+  orientViewportPreset,
+  viewportPresets,
+} from '../config/viewport-presets'
 import type {
   CaptureTask,
   PlatformId,
@@ -437,14 +441,16 @@ export const useRunStore = defineStore('run', () => {
     platformName: string,
     preset: ViewportPreset,
     captureDelayMs: CaptureDelayMs,
+    landscape: boolean,
   ): ScreenshotDevicePresetSnapshot {
+    const orientedPreset = orientViewportPreset(preset, landscape)
     return {
       selectionId: getPresetSelectionId(platformId, preset.id),
       platformId,
       platformName,
       presetId: preset.id,
-      presetName: preset.name,
-      viewport: { ...preset.viewport },
+      presetName: orientedPreset.name,
+      viewport: { ...orientedPreset.viewport },
       deviceScaleFactor: preset.deviceScaleFactor,
       isMobile: preset.isMobile,
       hasTouch: preset.hasTouch,
@@ -538,7 +544,7 @@ export const useRunStore = defineStore('run', () => {
         normalizeDeviceSnapshot(device, captureDelayMs),
       )
       const batch = await createBatch(url, note, captureDelayMs, normalizedDevices)
-      batchUrl.value = url
+      batchUrl.value = batch.url
       batchId.value = batch.batchId
       batchCaptureDelayMs.value = captureDelayMs
       currentBatch.value = batch
@@ -550,7 +556,7 @@ export const useRunStore = defineStore('run', () => {
 
       await Promise.all(
         tasks.value.map((task) =>
-          launchTask(task.id, url, task.preset, batch.batchId, captureDelayMs),
+          launchTask(task.id, batch.url, task.preset, batch.batchId, captureDelayMs),
         ),
       )
     } finally {
@@ -563,13 +569,14 @@ export const useRunStore = defineStore('run', () => {
     note: string,
     selectedPresetIds: string[],
     captureDelayMs: CaptureDelayMs,
+    landscape: boolean,
   ): Promise<void> {
     const selectedIds = new Set(selectedPresetIds)
     const devices = viewportPresets.flatMap((platform) =>
       platform.presets.flatMap<ScreenshotDevicePresetSnapshot>((preset) => {
         const selectionId = getPresetSelectionId(platform.id, preset.id)
         if (!selectedIds.has(selectionId)) return []
-        return [createPresetSnapshot(platform.id, platform.name, preset, captureDelayMs)]
+        return [createPresetSnapshot(platform.id, platform.name, preset, captureDelayMs, landscape)]
       }),
     )
     await startBatchFromSnapshots(url, note, captureDelayMs, devices)

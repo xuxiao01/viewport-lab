@@ -259,6 +259,33 @@ export function getPlatformPresetIds(platform: PlatformPresetGroup): string[] {
   return platform.presets.map((preset) => getPresetSelectionId(platform.id, preset.id))
 }
 
+export function orientViewportPreset(
+  preset: PlatformPresetGroup['presets'][number],
+  landscape: boolean,
+): PlatformPresetGroup['presets'][number] {
+  if (!landscape) return preset
+  const viewport = {
+    width: preset.viewport.height,
+    height: preset.viewport.width,
+  }
+  return {
+    ...preset,
+    name: `${viewport.width} × ${viewport.height}`,
+    viewport,
+  }
+}
+
+export function orientViewportPresets(
+  platforms: PlatformPresetGroup[],
+  landscape: boolean,
+): PlatformPresetGroup[] {
+  if (!landscape) return platforms
+  return platforms.map((platform) => ({
+    ...platform,
+    presets: platform.presets.map((preset) => orientViewportPreset(preset, true)),
+  }))
+}
+
 const defaultApplePhonePlatform = viewportPresets.find((platform) => platform.id === 'ios-phone')
 
 export const defaultSelectedPresetIds = defaultApplePhonePlatform

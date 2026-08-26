@@ -25,6 +25,7 @@ import TaskPromptOptimizerDialog from '../components/TaskPromptOptimizerDialog.v
 import {
   defaultSelectedPresetIds,
   getPlatformPresetIds,
+  orientViewportPresets,
   viewportPresets,
 } from '../config/viewport-presets'
 import { useRunStore } from '../stores/run'
@@ -45,6 +46,7 @@ const initialDraft = loadTaskDraft({
   maxTurns: agentTurnLimits.default,
   model: defaultAgentModel,
   captureDelayMs: 0,
+  landscape: false,
   selectedCategories: ['ios-phone'],
   activeCategory: 'ios-phone',
   selectedPresetIds: [...defaultSelectedPresetIds],
@@ -56,6 +58,7 @@ const aiTaskDescription = ref(initialDraft.aiTaskDescription)
 const maxTurns = ref(initialDraft.maxTurns)
 const model = ref<AgentModelName>(initialDraft.model)
 const captureDelayMs = ref<CaptureDelayMs>(initialDraft.captureDelayMs)
+const landscape = ref(initialDraft.landscape)
 const selectedCategories = ref<PlatformId[]>([...initialDraft.selectedCategories])
 const activeCategory = ref<PlatformId | null>(initialDraft.activeCategory)
 const selectedPresetIds = ref<string[]>([...initialDraft.selectedPresetIds])
@@ -84,6 +87,7 @@ watch(
     maxTurns,
     model,
     captureDelayMs,
+    landscape,
     selectedCategories,
     activeCategory,
     selectedPresetIds,
@@ -97,6 +101,7 @@ watch(
       maxTurns: maxTurns.value,
       model: model.value,
       captureDelayMs: captureDelayMs.value,
+      landscape: landscape.value,
       selectedCategories: [...selectedCategories.value],
       activeCategory: activeCategory.value,
       selectedPresetIds: [...selectedPresetIds.value],
@@ -112,6 +117,10 @@ const effectiveSelectedPresetIds = computed(() =>
     if (!selectedCategories.value.includes(platform.id)) return []
     return getPlatformPresetIds(platform).filter((id) => selectedPresetIds.value.includes(id))
   }),
+)
+
+const displayedViewportPresets = computed(() =>
+  orientViewportPresets(viewportPresets, landscape.value),
 )
 
 const resultPlatforms = computed(() =>
@@ -132,6 +141,7 @@ async function startDetectionTask(): Promise<void> {
       task: aiTaskDescription.value.trim(),
       note: note.value.trim(),
       selectedPresetIds: effectiveSelectedPresetIds.value,
+      landscape: landscape.value,
       maxTurns: maxTurns.value,
       model: model.value,
     })
@@ -152,6 +162,7 @@ async function startDetectionTask(): Promise<void> {
       note.value.trim(),
       effectiveSelectedPresetIds.value,
       captureDelayMs.value,
+      landscape.value,
     )
     selectedKind.value = 'viewport'
     if (store.selectedBatchId) {
@@ -213,6 +224,9 @@ function applyConfiguration(configuration: TestConfiguration): void {
       : agentTurnLimits.default
   model.value = configuration.kind === 'agent' ? configuration.model : defaultAgentModel
   captureDelayMs.value = configuration.kind === 'viewport' ? configuration.captureDelayMs : 0
+  landscape.value =
+    configuration.devices.length > 0 &&
+    configuration.devices.every((device) => device.viewport.width > device.viewport.height)
 
   const platformIds = [...new Set(configuration.devices.map((device) => device.platformId))]
   selectedCategories.value = orderCategories(platformIds)
@@ -499,11 +513,12 @@ onMounted(async () => {
         :max-turns="maxTurns"
         :model="model"
         :capture-delay-ms="captureDelayMs"
+        :landscape="landscape"
         :gateway-status="agentStore.gatewayStatus"
         :selected-categories="selectedCategories"
         :active-category="activeCategory"
         :selected-preset-ids="selectedPresetIds"
-        :platforms="viewportPresets"
+        :platforms="displayedViewportPresets"
         :running="taskSubmitting"
         :optimizing="agentStore.optimizing"
         @update:url="url = $event"
@@ -512,6 +527,7 @@ onMounted(async () => {
         @update:max-turns="maxTurns = $event"
         @update:model="model = $event"
         @update:capture-delay-ms="captureDelayMs = $event"
+        @update:landscape="landscape = $event"
         @update:active-category="updateActiveCategory"
         @update:selected-preset-ids="selectedPresetIds = $event"
         @toggle-category="toggleCategory"

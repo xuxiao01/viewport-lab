@@ -5,8 +5,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '../../', '')
   const target = env.VITE_SERVER_TARGET || 'http://localhost:3001'
   const proxy = {
-    '/api': target,
-    '/outputs': target,
+    '/api': { target, xfwd: true },
+    '/outputs': { target, xfwd: true },
   }
 
   return {
