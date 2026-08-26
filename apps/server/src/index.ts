@@ -32,7 +32,7 @@ import type {
 } from '@viewport-lab/shared'
 import Fastify from 'fastify'
 import { chromium } from 'playwright'
-import type { Page } from 'playwright'
+import type { Browser, Page } from 'playwright'
 
 import { registerAgent } from './agent/index.js'
 import { normalizeInterruptedAgentRuns } from './agent/recorder.js'
@@ -60,6 +60,9 @@ const batchWriteQueues = new Map<string, Promise<void>>()
 const batchUpdateQueues = new Map<string, Promise<void>>()
 const subscribers = new Map<string, Set<(event: RunEvent) => void>>()
 const viewportBatchScheduler = new SerialBatchScheduler()
+const deletedBatchIds = new Set<string>()
+const activeViewportBrowsers = new Map<string, Set<Browser>>()
+const activeViewportExecutions = new Map<string, Set<Promise<void>>>()
 const runIdPattern = /^[0-9a-f-]{36}$/i
 const outputNamePattern = /^[a-z0-9][a-z0-9-]{0,63}$/
 const selectionIdPattern = /^[a-z0-9][a-z0-9:-]{0,127}$/
@@ -254,6 +257,47 @@ function isTerminalBatchStatus(status: BatchManifest['status']): boolean {
   return status === 'completed' || status === 'partial_failed' || status === 'failed'
 }
 
+function isBatchDeleted(batchId: string): boolean {
+  return deletedBatchIds.has(batchId)
+}
+
+function registerViewportBrowser(batchId: string, browser: Browser): void {
+  const browsers = activeViewportBrowsers.get(batchId) ?? new Set<Browser>()
+  browsers.add(browser)
+  activeViewportBrowsers.set(batchId, browsers)
+}
+
+function unregisterViewportBrowser(batchId: string, browser: Browser): void {
+  const browsers = activeViewportBrowsers.get(batchId)
+  browsers?.delete(browser)
+  if (browsers?.size === 0) activeViewportBrowsers.delete(batchId)
+}
+
+function trackViewportExecution(batchId: string, execution: Promise<void>): void {
+  const executions = activeViewportExecutions.get(batchId) ?? new Set<Promise<void>>()
+  executions.add(execution)
+  activeViewportExecutions.set(batchId, executions)
+  execution.then(
+    () => removeTrackedViewportExecution(batchId, execution),
+    () => removeTrackedViewportExecution(batchId, execution),
+  )
+}
+
+function removeTrackedViewportExecution(batchId: string, execution: Promise<void>): void {
+  const executions = activeViewportExecutions.get(batchId)
+  executions?.delete(execution)
+  if (executions?.size === 0) activeViewportExecutions.delete(batchId)
+}
+
+async function cancelViewportBatch(batchId: string): Promise<void> {
+  deletedBatchIds.add(batchId)
+  const schedulerCancellation = viewportBatchScheduler.cancel(batchId)
+  const browsers = [...(activeViewportBrowsers.get(batchId) ?? [])]
+  await Promise.allSettled(browsers.map((browser) => browser.close()))
+  await Promise.allSettled([...(activeViewportExecutions.get(batchId) ?? [])])
+  await schedulerCancellation
+}
+
 function aggregateBatch(batch: BatchManifest, now: string): BatchManifest {
   const successCount = batch.devices.filter((device) => device.status === 'completed').length
   const failedCount = batch.devices.filter((device) => device.status === 'failed').length
@@ -294,6 +338,7 @@ async function persistBatch(batch: BatchManifest): Promise<void> {
 }
 
 async function readBatch(batchId: string): Promise<BatchManifest | null> {
+  if (isBatchDeleted(batchId)) return null
   const memoryBatch = batches.get(batchId)
   if (memoryBatch) return memoryBatch
   if (!archiveIdPattern.test(batchId)) return null
@@ -411,7 +456,9 @@ async function enqueueBatchUpdate(batchId: string, operation: () => Promise<void
 
 async function updateBatchForRun(run: RunManifest): Promise<void> {
   const batchId = run.request.batchId
+  if (isBatchDeleted(batchId)) return
   await enqueueBatchUpdate(batchId, async () => {
+    if (isBatchDeleted(batchId)) return
     const batch = await readBatch(batchId)
     if (!batch) throw new Error(`Batch ${batchId} does not exist`)
     const deviceIndex = batch.devices.findIndex(
@@ -465,16 +512,20 @@ async function updateRun(runId: string, patch: Partial<RunManifest>): Promise<Ru
   const updated: RunManifest = { ...current, ...patch, updatedAt: new Date().toISOString() }
   runs.set(runId, updated)
   await updateBatchForRun(updated)
+  if (isBatchDeleted(updated.request.batchId)) {
+    throw new Error(`Batch ${updated.request.batchId} was deleted`)
+  }
   publish(updated)
   return updated
 }
 
 async function getRun(runId: string): Promise<RunManifest | null> {
   const memoryRun = runs.get(runId)
-  if (memoryRun) return memoryRun
+  if (memoryRun) return isBatchDeleted(memoryRun.request.batchId) ? null : memoryRun
   if (!runIdPattern.test(runId)) return null
 
   for (const batch of await listBatches()) {
+    if (isBatchDeleted(batch.batchId)) continue
     const device = batch.devices.find((item) => item.runId === runId)
     if (device) return runFromDevice(batch, device)
   }
@@ -660,9 +711,17 @@ async function captureScreenshot(
 
 async function executeRun(runId: string): Promise<void> {
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null
+  let batchId: string | null = null
   try {
+    const initialRun = runs.get(runId)
+    if (!initialRun) return
+    batchId = initialRun.request.batchId
+    if (isBatchDeleted(batchId)) return
     const launching = await updateRun(runId, { status: 'launching' })
+    if (isBatchDeleted(batchId)) return
     browser = await chromium.launch()
+    registerViewportBrowser(batchId, browser)
+    if (isBatchDeleted(batchId)) return
     const context = await browser.newContext({
       viewport: launching.request.viewport,
       screen: launching.request.viewport,
@@ -702,6 +761,7 @@ async function executeRun(runId: string): Promise<void> {
       error: null,
     })
   } catch (error) {
+    if (batchId && isBatchDeleted(batchId)) return
     try {
       await updateRun(runId, {
         status: 'failed',
@@ -715,6 +775,7 @@ async function executeRun(runId: string): Promise<void> {
       )
     }
   } finally {
+    if (batchId && browser) unregisterViewportBrowser(batchId, browser)
     try {
       await browser?.close()
     } catch (closeError) {
@@ -895,9 +956,7 @@ app.delete<{ Params: { batchId: string } }>('/api/batches/:batchId', async (requ
   const { batchId } = request.params
   const batch = await readBatch(batchId)
   if (!batch) return reply.code(404).send({ error: 'Screenshot batch not found' })
-  if (!isTerminalBatchStatus(batch.status)) {
-    return reply.code(409).send({ error: 'Running screenshot batches cannot be deleted' })
-  }
+  await cancelViewportBatch(batchId)
   await batchUpdateQueues.get(batchId)
   await batchWriteQueues.get(batchId)
   for (const device of batch.devices) {
@@ -907,7 +966,7 @@ app.delete<{ Params: { batchId: string } }>('/api/batches/:batchId', async (requ
     }
   }
   batches.delete(batchId)
-  await rm(resolve(runsDir, batchId), { recursive: true })
+  await rm(resolve(runsDir, batchId), { recursive: true, force: true })
   return reply.code(204).send()
 })
 
@@ -945,9 +1004,15 @@ app.post<{ Body: unknown; Reply: CreateRunResponse | ApiErrorResponse }>(
     }
     runs.set(runId, run)
     await updateBatchForRun(run)
+    if (isBatchDeleted(parsed.batchId)) {
+      runs.delete(runId)
+      return reply.code(404).send({ error: 'Screenshot batch not found' })
+    }
     viewportBatchScheduler.enqueue(parsed.batchId, expectedRunCount, async () => {
       try {
-        await executeRun(runId)
+        const execution = executeRun(runId)
+        trackViewportExecution(parsed.batchId, execution)
+        await execution
       } catch (error: unknown) {
         app.log.error({ err: error, runId }, 'Unexpected screenshot task failure')
         throw error

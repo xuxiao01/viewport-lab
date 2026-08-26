@@ -30,6 +30,8 @@ const props = defineProps<{
   error: string | null
   retryable: boolean
   running: boolean
+  deletingBatchId: string | null
+  deletingAgentRunId: string | null
   agentRerunning: boolean
   agentRerunListUpdatingDeviceId: string | null
   savedConfigurationSourceKeys: Set<string>
@@ -215,10 +217,10 @@ function candidateLabel(batch: BatchSummary): string {
 }
 
 async function confirmDelete(): Promise<void> {
-  if (!props.batch) return
+  if (!props.batch || props.deletingBatchId === props.batch.batchId) return
   try {
     await ElMessageBox.confirm(
-      '删除后，该批次的 manifest 和全部截图图片都将从本地磁盘永久移除。',
+      '该批次可能仍在运行，确认后会取消未完成任务，并将 manifest 和全部截图图片从本地磁盘永久移除。',
       '删除截图批次',
       {
         confirmButtonText: '确认删除',
@@ -233,10 +235,10 @@ async function confirmDelete(): Promise<void> {
 }
 
 async function confirmDeleteAgent(): Promise<void> {
-  if (!props.agentRun) return
+  if (!props.agentRun || props.deletingAgentRunId === props.agentRun.runId) return
   try {
     await ElMessageBox.confirm(
-      '删除后，该 Agent 批次的 manifest、最终截图和全部步骤记录都将从本地磁盘永久移除。',
+      '该批次可能仍在运行，确认后会取消未完成任务，并将 manifest、最终截图和全部步骤记录从本地磁盘永久移除。',
       '删除 Agent 批次',
       {
         confirmButtonText: '确认删除',
@@ -482,10 +484,10 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'partial
                 <button
                   type="button"
                   class="delete-button"
-                  :disabled="batch.status === 'queued' || batch.status === 'running'"
+                  :disabled="deletingBatchId === batch.batchId"
                   @click="confirmDelete"
                 >
-                  删除批次
+                  {{ deletingBatchId === batch.batchId ? '删除中…' : '删除批次' }}
                 </button>
               </div>
             </div>
@@ -615,10 +617,10 @@ const terminalAgentStatuses = new Set<AgentRun['status']>(['completed', 'partial
                 <button
                   type="button"
                   class="delete-button"
-                  :disabled="!['completed', 'partial', 'failed', 'cancelled'].includes(agentRun.status)"
+                  :disabled="deletingAgentRunId === agentRun.runId"
                   @click="confirmDeleteAgent"
                 >
-                  删除批次
+                  {{ deletingAgentRunId === agentRun.runId ? '删除中…' : '删除批次' }}
                 </button>
               </div>
             </div>

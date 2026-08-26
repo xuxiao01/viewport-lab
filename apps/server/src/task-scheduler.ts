@@ -43,7 +43,10 @@ interface BatchGroup {
   expectedCount: number
   registeredCount: number
   completedCount: number
+  activeCount: number
   tasks: ScheduledTask[]
+  cancelled: boolean
+  cancelWaiters: Array<() => void>
 }
 
 export class SerialBatchScheduler {
@@ -59,7 +62,10 @@ export class SerialBatchScheduler {
         expectedCount: Math.max(1, expectedCount),
         registeredCount: 0,
         completedCount: 0,
+        activeCount: 0,
         tasks: [],
+        cancelled: false,
+        cancelWaiters: [],
       }
       this.groups.set(groupId, group)
       this.order.push(groupId)
@@ -68,6 +74,33 @@ export class SerialBatchScheduler {
     group.registeredCount += 1
     group.tasks.push(task)
     this.pump()
+  }
+
+  /**
+   * Cancels a batch's queued work and waits for work that has already started.
+   * Pending groups are removed immediately; the active group is released after
+   * its currently running tasks settle.
+   */
+  cancel(groupId: string): Promise<void> {
+    const group = this.groups.get(groupId)
+    if (!group) return Promise.resolve()
+
+    if (group.id !== this.activeGroupId) {
+      group.tasks.splice(0)
+      this.groups.delete(groupId)
+      const index = this.order.indexOf(groupId)
+      if (index >= 0) this.order.splice(index, 1)
+      return Promise.resolve()
+    }
+
+    const completion = new Promise<void>((resolve) => {
+      group.cancelWaiters.push(resolve)
+    })
+    group.cancelled = true
+    group.tasks.splice(0)
+    group.expectedCount = group.completedCount + group.activeCount
+    this.finishGroupIfReady(group)
+    return completion
   }
 
   seal(groupId: string): void {
@@ -97,9 +130,12 @@ export class SerialBatchScheduler {
       return
     }
     for (const task of group.tasks.splice(0)) {
+      if (group.cancelled) break
+      group.activeCount += 1
       void task()
         .catch(() => undefined)
         .finally(() => {
+          group.activeCount -= 1
           group.completedCount += 1
           this.finishGroupIfReady(group)
         })
@@ -120,9 +156,11 @@ export class SerialBatchScheduler {
   private releaseActiveGroup(): void {
     const completedId = this.activeGroupId
     if (completedId) {
+      const completedGroup = this.groups.get(completedId)
       this.groups.delete(completedId)
       const index = this.order.indexOf(completedId)
       if (index >= 0) this.order.splice(index, 1)
+      for (const resolve of completedGroup?.cancelWaiters ?? []) resolve()
     }
     this.activeGroupId = null
     this.pump()

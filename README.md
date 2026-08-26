@@ -265,7 +265,7 @@ data/runs/{YYYY-MM-DD_HH-mm-ss-SSS_随机ID}/
 | `GET`    | `/api/batches`                | 获取普通截图批次列表         |
 | `GET`    | `/api/batches/:batchId`       | 获取普通截图批次详情         |
 | `POST`   | `/api/batches/:batchId/rerun` | 在原批次内重跑全部或失败设备 |
-| `DELETE` | `/api/batches/:batchId`       | 删除终态批次和本地文件       |
+| `DELETE` | `/api/batches/:batchId`       | 取消未完成任务后删除批次和本地文件 |
 | `POST`   | `/api/runs`                   | 创建单个设备截图任务         |
 | `GET`    | `/api/runs/:runId`            | 获取单设备任务状态           |
 | `GET`    | `/api/runs/:runId/events`     | 订阅单设备 SSE 事件          |

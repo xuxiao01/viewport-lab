@@ -83,6 +83,8 @@ export const useAgentStore = defineStore('agent', () => {
   const error = ref<string | null>(null)
   const eventSources = new Map<string, EventSource>()
   const activeRerunDeviceIds = new Map<string, Set<string>>()
+  const deletedRunIds = new Set<string>()
+  const deletingRunId = ref<string | null>(null)
 
   const isRunning = computed(() =>
     runHistory.value.some((run) => !terminalStatuses.has(run.status)),
@@ -183,6 +185,7 @@ export const useAgentStore = defineStore('agent', () => {
   }
 
   function applyRunUpdate(incomingRun: AgentRun): AgentRun {
+    if (deletedRunIds.has(incomingRun.runId)) return incomingRun
     const isSelected = selectedRunId.value === incomingRun.runId
     const mergedRun = isSelected ? mergeRunUpdate(incomingRun) : incomingRun
     if (isSelected) currentRun.value = mergedRun
@@ -427,9 +430,21 @@ export const useAgentStore = defineStore('agent', () => {
   }
 
   async function deleteRun(runId: string): Promise<void> {
-    const response = await fetch(`/api/agent/runs/${runId}`, { method: 'DELETE' })
-    if (!response.ok) throw new Error(await readApiError(response, '删除 Agent 运行失败'))
+    deletedRunIds.add(runId)
+    deletingRunId.value = runId
     stopWatching(runId)
+    try {
+      const response = await fetch(`/api/agent/runs/${runId}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await readApiError(response, '删除 Agent 运行失败'))
+    } catch (error) {
+      deletedRunIds.delete(runId)
+      if (currentRun.value?.runId === runId && !terminalStatuses.has(currentRun.value.status)) {
+        watchRun(runId)
+      }
+      throw error
+    } finally {
+      if (deletingRunId.value === runId) deletingRunId.value = null
+    }
     activeRerunDeviceIds.delete(runId)
     runHistory.value = runHistory.value.filter((item) => item.runId !== runId)
     if (selectedRunId.value === runId) {
@@ -464,6 +479,7 @@ export const useAgentStore = defineStore('agent', () => {
     updateRerunList,
     updateRunNote,
     deleteRun,
+    deletingRunId,
     stopWatching,
   }
 })

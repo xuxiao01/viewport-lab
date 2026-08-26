@@ -200,6 +200,8 @@ export const useRunStore = defineStore('run', () => {
   const eventSources = new Map<string, EventSource>()
   const pollTimers = new Map<string, number>()
   const finalizingBatches = new Set<string>()
+  const deletedBatchIds = new Set<string>()
+  const deletingBatchId = ref<string | null>(null)
 
   const totalCount = computed(() => tasks.value.length)
   const completedCount = computed(
@@ -272,6 +274,7 @@ export const useRunStore = defineStore('run', () => {
   }
 
   function syncBatch(run: RunManifest): BatchManifest | null {
+    if (deletedBatchIds.has(run.request.batchId)) return null
     const batch =
       activeBatches.value[run.request.batchId] ??
       (currentBatch.value?.batchId === run.request.batchId ? currentBatch.value : null) ??
@@ -344,6 +347,7 @@ export const useRunStore = defineStore('run', () => {
   }
 
   function applyRun(run: RunManifest): void {
+    if (deletedBatchIds.has(run.request.batchId)) return
     if (batchId.value === run.request.batchId) {
       updateTask(run.request.selectionId, { run, status: run.status, error: run.error })
     }
@@ -478,6 +482,7 @@ export const useRunStore = defineStore('run', () => {
     currentBatchId: string,
     captureDelayMs: CaptureDelayMs,
   ): Promise<void> {
+    if (deletedBatchIds.has(currentBatchId)) return
     try {
       const response = await fetch('/api/runs', {
         method: 'POST',
@@ -486,9 +491,14 @@ export const useRunStore = defineStore('run', () => {
       })
       if (!response.ok) throw new Error(await readApiError(response, '创建截图任务失败'))
       const body = (await response.json()) as CreateRunResponse
+      if (deletedBatchIds.has(currentBatchId)) {
+        stopWatching(body.run.runId)
+        return
+      }
       applyRun(body.run)
       watchRun(body.run.runId)
     } catch (error) {
+      if (deletedBatchIds.has(currentBatchId)) return
       const message = error instanceof Error ? error.message : '创建截图任务失败'
       if (batchId.value === currentBatchId) updateTask(taskId, { status: 'failed', error: message })
       const batch = activeBatches.value[currentBatchId]
@@ -719,13 +729,29 @@ export const useRunStore = defineStore('run', () => {
   }
 
   async function deleteBatch(id: string): Promise<void> {
-    const response = await fetch(`/api/batches/${id}`, { method: 'DELETE' })
-    if (!response.ok) throw new Error(await readApiError(response, '删除截图批次失败'))
     const active = activeBatches.value[id]
+    deletedBatchIds.add(id)
+    deletingBatchId.value = id
     if (active) {
       for (const device of active.devices) {
         if (device.runId) stopWatching(device.runId)
       }
+    }
+    try {
+      const response = await fetch(`/api/batches/${id}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await readApiError(response, '删除截图批次失败'))
+    } catch (error) {
+      deletedBatchIds.delete(id)
+      if (active) {
+        for (const device of active.devices) {
+          if (device.runId && !terminalStatuses.has(device.status)) watchRun(device.runId)
+        }
+      }
+      throw error
+    } finally {
+      if (deletingBatchId.value === id) deletingBatchId.value = null
+    }
+    if (active) {
       const remaining = { ...activeBatches.value }
       delete remaining[id]
       activeBatches.value = remaining
@@ -782,6 +808,7 @@ export const useRunStore = defineStore('run', () => {
     selectBatch,
     updateBatchNote,
     deleteBatch,
+    deletingBatchId,
     setBaselineBatch,
     setComparisonBatch,
   }

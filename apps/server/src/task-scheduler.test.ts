@@ -57,6 +57,60 @@ test('SerialBatchScheduler keeps batches serial while running one batch tasks to
   assert.deepEqual(events.slice(0, 2).sort(), ['a0:start', 'a1:start'])
 })
 
+test('SerialBatchScheduler cancels a pending batch without starting its tasks', async () => {
+  const scheduler = new SerialBatchScheduler()
+  let activeReady = false
+  let releaseActive = (): void => undefined
+  let pendingBatchStarted = false
+
+  scheduler.enqueue('active-batch', 1, async () => {
+    await new Promise<void>((resolve) => {
+      releaseActive = resolve
+      activeReady = true
+    })
+  })
+  scheduler.enqueue('deleted-batch', 2, async () => {
+    pendingBatchStarted = true
+  })
+  scheduler.enqueue('next-batch', 1, async () => undefined)
+
+  await waitFor(() => activeReady)
+  await scheduler.cancel('deleted-batch')
+  releaseActive()
+  await waitFor(() => scheduler.activeBatchId === null)
+
+  assert.equal(pendingBatchStarted, false)
+})
+
+test('SerialBatchScheduler waits for active tasks before releasing a cancelled batch', async () => {
+  const scheduler = new SerialBatchScheduler()
+  let activeReady = false
+  let releaseActive = (): void => undefined
+  let activeTaskFinished = false
+  let nextBatchStarted = false
+
+  scheduler.enqueue('deleted-batch', 1, async () => {
+    await new Promise<void>((resolve) => {
+      releaseActive = resolve
+      activeReady = true
+    })
+    activeTaskFinished = true
+  })
+  scheduler.enqueue('next-batch', 1, async () => {
+    nextBatchStarted = true
+  })
+
+  await waitFor(() => activeReady)
+  const cancellation = scheduler.cancel('deleted-batch')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(activeTaskFinished, false)
+
+  releaseActive()
+  await cancellation
+  await waitFor(() => nextBatchStarted)
+  assert.equal(activeTaskFinished, true)
+})
+
 test('ConcurrencyScheduler releases a slot after a task fails', async () => {
   const scheduler = new ConcurrencyScheduler(1)
   let nextTaskStarted = false
